@@ -5,6 +5,7 @@ package api
 const (
 	ActionRegister           = "register"
 	ActionCreateUser         = "createUser"
+	ActionValidatePatient    = "validatePatient"
 	ActionLogin              = "login"
 	ActionUploadRecord       = "uploadRecord"
 	ActionCreateQueryRequest = "createQueryRequest"
@@ -34,6 +35,7 @@ type Response struct {
 	Message         string         `json:"message"`
 	Token           string         `json:"token,omitempty"`
 	Role            UserRole       `json:"role,omitempty"`
+	PatientID       string         `json:"patientId,omitempty"`
 	RecordsUploaded int            `json:"recordsUploaded,omitempty"`
 	StatsRows       []StatsRow     `json:"statsRows,omitempty"`
 	QueryRequests   []StatsRequest `json:"queryRequests,omitempty"`

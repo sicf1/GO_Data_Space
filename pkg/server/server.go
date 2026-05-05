@@ -1,5 +1,5 @@
-// El paquete server contiene el código del servidor.
-// Interactúa con el cliente mediante una API JSON/HTTPS.
+// El paquete server contiene el codigo del servidor.
+// Interactua con el cliente mediante una API JSON/HTTPS.
 package server
 
 import (
@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,10 +35,11 @@ import (
 )
 
 const (
-	usersNamespace    = "users"
-	sessionsNamespace = "sessions"
-	recordsNamespace  = "records"
-	queriesNamespace  = "queries"
+	usersNamespace      = "users"
+	sessionsNamespace   = "sessions"
+	recordsNamespace    = "records"
+	queriesNamespace    = "queries"
+	patientIDsNamespace = "patient_ids"
 )
 
 type server struct {
@@ -51,6 +53,7 @@ type userRecord struct {
 	PasswordSalt   string       `json:"passwordSalt"`
 	PasswordHash   string       `json:"passwordHash"`
 	Role           api.UserRole `json:"role"`
+	PatientID      string       `json:"patientId,omitempty"`
 	DataUseAllowed bool         `json:"dataUseAllowed"`
 	CreatedAt      string       `json:"createdAt"`
 }
@@ -61,6 +64,22 @@ type sessionRecord struct {
 	IssuedAt  string       `json:"issuedAt"`
 	LastSeen  string       `json:"lastSeen"`
 	ExpiresAt string       `json:"expiresAt"`
+}
+
+type legacyStoredRecord struct {
+	ID              string `json:"id"`
+	Classification  string `json:"classification"`
+	AgeRange        string `json:"ageRange"`
+	Sex             string `json:"sex"`
+	PatientID       string `json:"patientId"`
+	PatientUsername string `json:"patientUsername"`
+	CreatedAt       string `json:"createdAt"`
+	UploadedBy      string `json:"uploadedBy"`
+}
+
+type patientUser struct {
+	key  []byte
+	user userRecord
 }
 
 func Run(cfg Config) error {
@@ -82,10 +101,9 @@ func Run(cfg Config) error {
 	}
 	defer db.Close()
 
-	srv := &server{
-		db:                 db,
-		log:                log.New(os.Stdout, "[srv] ", log.LstdFlags),
-		sessionIdleTimeout: cfg.SessionIdleTimeout,
+	srv, err := newServer(db, cfg.SessionIdleTimeout)
+	if err != nil {
+		return err
 	}
 
 	mux := http.NewServeMux()
@@ -123,10 +141,9 @@ func BootstrapInitialAdmin(cfg Config, username, password string) error {
 	}
 	defer db.Close()
 
-	srv := &server{
-		db:                 db,
-		log:                log.New(os.Stdout, "[srv] ", log.LstdFlags),
-		sessionIdleTimeout: cfg.SessionIdleTimeout,
+	srv, err := newServer(db, cfg.SessionIdleTimeout)
+	if err != nil {
+		return err
 	}
 	if hasRole(db, api.RoleAdmin) {
 		return nil
@@ -136,6 +153,18 @@ func BootstrapInitialAdmin(cfg Config, username, password string) error {
 		return errors.New(res.Message)
 	}
 	return nil
+}
+
+func newServer(db store.Store, timeout time.Duration) (*server, error) {
+	srv := &server{
+		db:                 db,
+		log:                log.New(os.Stdout, "[srv] ", log.LstdFlags),
+		sessionIdleTimeout: timeout,
+	}
+	if err := srv.ensurePatientIdentifiers(); err != nil {
+		return nil, err
+	}
+	return srv, nil
 }
 
 func openSecureStore(cfg Config) (store.Store, error) {
@@ -167,7 +196,7 @@ func openSecureStore(cfg Config) (store.Store, error) {
 
 func (s *server) apiHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Método no permitido", http.StatusMethodNotAllowed)
+		http.Error(w, "Metodo no permitido", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -191,6 +220,8 @@ func (s *server) apiHandler(w http.ResponseWriter, r *http.Request) {
 		res = s.registerBootstrapAdmin(req.Username, req.Password)
 	case api.ActionCreateUser:
 		res = s.createUser(req)
+	case api.ActionValidatePatient:
+		res = s.validatePatient(req)
 	case api.ActionLogin:
 		res = s.loginUser(req)
 	case api.ActionUploadRecord:
@@ -206,7 +237,7 @@ func (s *server) apiHandler(w http.ResponseWriter, r *http.Request) {
 	case api.ActionLogout:
 		res = s.logoutUser(req)
 	default:
-		res = api.Response{Success: false, Message: "Acción desconocida"}
+		res = api.Response{Success: false, Message: "Accion desconocida"}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -226,7 +257,7 @@ func (s *server) createUser(req api.Request) api.Response {
 		return api.Response{Success: false, Message: "No autorizado para crear usuarios"}
 	}
 	if req.Role == api.RoleAdmin {
-		return api.Response{Success: false, Message: "El alta de administradores no está permitida desde el menú"}
+		return api.Response{Success: false, Message: "El alta de administradores no esta permitida desde el menu"}
 	}
 	return s.createUserRecord(req.Username, req.Password, req.Role)
 }
@@ -239,7 +270,7 @@ func (s *server) createUserRecord(username, password string, role api.UserRole) 
 	switch role {
 	case api.RoleAdmin, api.RoleDoctor, api.RoleResearcher, api.RolePatient:
 	default:
-		return api.Response{Success: false, Message: "Rol no válido"}
+		return api.Response{Success: false, Message: "Rol no valido"}
 	}
 
 	exists, err := s.userExists(username)
@@ -255,19 +286,57 @@ func (s *server) createUserRecord(username, password string, role api.UserRole) 
 		return api.Response{Success: false, Message: "Error interno generando credenciales"}
 	}
 	hash := argon2.IDKey([]byte(password), salt, 1, 64*1024, 4, 32)
+	now := time.Now().UTC()
 	record := userRecord{
 		Username:       username,
 		PasswordSalt:   base64.StdEncoding.EncodeToString(salt),
 		PasswordHash:   base64.StdEncoding.EncodeToString(hash),
 		Role:           role,
 		DataUseAllowed: true,
-		CreatedAt:      time.Now().UTC().Format(time.RFC3339),
+		CreatedAt:      now.Format(time.RFC3339),
+	}
+	if role == api.RolePatient {
+		patientID, err := s.allocateNextPatientID()
+		if err != nil {
+			return api.Response{Success: false, Message: "Error al asignar el identificador anonimizado del paciente"}
+		}
+		record.PatientID = patientID
 	}
 	if err := putJSON(s.db, usersNamespace, []byte(username), record); err != nil {
 		return api.Response{Success: false, Message: "Error al guardar credenciales"}
 	}
+	if record.PatientID != "" {
+		if err := s.db.Put(patientIDsNamespace, []byte(record.PatientID), []byte(username)); err != nil {
+			_ = s.db.Delete(usersNamespace, []byte(username))
+			return api.Response{Success: false, Message: "Error al guardar el identificador anonimizado del paciente"}
+		}
+	}
 
 	return api.Response{Success: true, Message: "Usuario creado correctamente", Role: role}
+}
+
+func (s *server) validatePatient(req api.Request) api.Response {
+	session, ok := s.authenticate(req.Token)
+	if !ok {
+		return api.Response{Success: false, Message: "Token invalido o sesion expirada"}
+	}
+	if session.Role != api.RoleDoctor && session.Role != api.RoleAdmin {
+		return api.Response{Success: false, Message: "No autorizado para validar pacientes"}
+	}
+
+	username := strings.TrimSpace(req.Username)
+	if username == "" {
+		return api.Response{Success: false, Message: "Falta el usuario del paciente"}
+	}
+
+	patient, err := s.loadUser(username)
+	if err != nil || patient.Role != api.RolePatient {
+		return api.Response{Success: false, Message: "El paciente indicado no existe"}
+	}
+	if patient.PatientID == "" {
+		return api.Response{Success: false, Message: "El paciente no tiene identificador anonimizado asignado"}
+	}
+	return api.Response{Success: true, Message: "Paciente valido", PatientID: patient.PatientID}
 }
 
 func (s *server) loginUser(req api.Request) api.Response {
@@ -279,12 +348,12 @@ func (s *server) loginUser(req api.Request) api.Response {
 
 	user, err := s.loadUser(username)
 	if err != nil || !verifyPassword(user, password) {
-		return api.Response{Success: false, Message: "Credenciales inválidas"}
+		return api.Response{Success: false, Message: "Credenciales invalidas"}
 	}
 
 	token, err := generateSessionToken()
 	if err != nil {
-		return api.Response{Success: false, Message: "Error interno de sesión"}
+		return api.Response{Success: false, Message: "Error interno de sesion"}
 	}
 	now := time.Now().UTC()
 	session := sessionRecord{
@@ -295,7 +364,7 @@ func (s *server) loginUser(req api.Request) api.Response {
 		ExpiresAt: now.Add(s.sessionIdleTimeout).Format(time.RFC3339),
 	}
 	if err := putJSON(s.db, sessionsNamespace, []byte(sessionKey(token)), session); err != nil {
-		return api.Response{Success: false, Message: "Error al crear sesión"}
+		return api.Response{Success: false, Message: "Error al crear sesion"}
 	}
 
 	res := api.Response{
@@ -314,22 +383,22 @@ func (s *server) loginUser(req api.Request) api.Response {
 func (s *server) uploadRecord(req api.Request) api.Response {
 	session, ok := s.authenticate(req.Token)
 	if !ok {
-		return api.Response{Success: false, Message: "Token inválido o sesión expirada"}
+		return api.Response{Success: false, Message: "Token invalido o sesion expirada"}
 	}
 	if session.Role != api.RoleDoctor {
-		return api.Response{Success: false, Message: "Solo un médico puede introducir datos de paciente"}
+		return api.Response{Success: false, Message: "Solo un medico puede introducir datos de paciente"}
 	}
 	if req.Record == nil {
 		return api.Response{Success: false, Message: "Falta el registro anonimizado"}
 	}
 	if err := req.Record.Validate(); err != nil {
-		return api.Response{Success: false, Message: "Registro inválido"}
+		return api.Response{Success: false, Message: "Registro invalido"}
 	}
 	if req.Record.UploadedBy != session.Username {
-		return api.Response{Success: false, Message: "El registro no pertenece al médico autenticado"}
+		return api.Response{Success: false, Message: "El registro no pertenece al medico autenticado"}
 	}
 
-	patient, err := s.loadUser(req.Record.PatientUsername)
+	patient, err := s.loadPatientByID(req.Record.PatientID)
 	if err != nil || patient.Role != api.RolePatient {
 		return api.Response{Success: false, Message: "El paciente indicado no existe"}
 	}
@@ -347,7 +416,7 @@ func (s *server) uploadRecord(req api.Request) api.Response {
 func (s *server) createQueryRequest(req api.Request) api.Response {
 	session, ok := s.authenticate(req.Token)
 	if !ok {
-		return api.Response{Success: false, Message: "Token inválido o sesión expirada"}
+		return api.Response{Success: false, Message: "Token invalido o sesion expirada"}
 	}
 	if session.Role != api.RoleResearcher {
 		return api.Response{Success: false, Message: "Solo un investigador puede pedir consultas"}
@@ -360,12 +429,12 @@ func (s *server) createQueryRequest(req api.Request) api.Response {
 	if query.Classification != "" {
 		normalized, err := api.NormalizeClassification(query.Classification)
 		if err != nil {
-			return api.Response{Success: false, Message: "Clasificación no válida"}
+			return api.Response{Success: false, Message: "Clasificacion no valida"}
 		}
 		query.Classification = normalized
 	}
 	if query.AgeRange != "" && ageRangeOrder(query.AgeRange) == 99 {
-		return api.Response{Success: false, Message: "Rango de edad no válido"}
+		return api.Response{Success: false, Message: "Rango de edad no valido"}
 	}
 
 	request := api.StatsRequest{
@@ -377,15 +446,15 @@ func (s *server) createQueryRequest(req api.Request) api.Response {
 		CreatedAt:      time.Now().UTC().Format(time.RFC3339),
 	}
 	if err := putJSON(s.db, queriesNamespace, []byte(request.ID), request); err != nil {
-		return api.Response{Success: false, Message: "Error al guardar la petición"}
+		return api.Response{Success: false, Message: "Error al guardar la peticion"}
 	}
-	return api.Response{Success: true, Message: "Petición de consulta registrada"}
+	return api.Response{Success: true, Message: "Peticion de consulta registrada"}
 }
 
 func (s *server) listQueryRequests(req api.Request) api.Response {
 	session, ok := s.authenticate(req.Token)
 	if !ok {
-		return api.Response{Success: false, Message: "Token inválido o sesión expirada"}
+		return api.Response{Success: false, Message: "Token invalido o sesion expirada"}
 	}
 	if session.Role != api.RoleAdmin && session.Role != api.RoleResearcher {
 		return api.Response{Success: false, Message: "No autorizado para consultar peticiones"}
@@ -411,7 +480,7 @@ func (s *server) listQueryRequests(req api.Request) api.Response {
 		if session.Role == api.RoleResearcher && query.Status == api.QueryApproved {
 			rows, err := s.computeStats(query)
 			if err != nil {
-				return api.Response{Success: false, Message: "Error al generar estadísticas"}
+				return api.Response{Success: false, Message: "Error al generar estadisticas"}
 			}
 			query.StatsRows = rows
 		}
@@ -431,24 +500,24 @@ func (s *server) listQueryRequests(req api.Request) api.Response {
 func (s *server) reviewQueryRequest(req api.Request) api.Response {
 	session, ok := s.authenticate(req.Token)
 	if !ok {
-		return api.Response{Success: false, Message: "Token inválido o sesión expirada"}
+		return api.Response{Success: false, Message: "Token invalido o sesion expirada"}
 	}
 	if session.Role != api.RoleAdmin {
 		return api.Response{Success: false, Message: "Solo un administrador puede revisar peticiones"}
 	}
 	if strings.TrimSpace(req.QueryID) == "" {
-		return api.Response{Success: false, Message: "Falta el identificador de la petición"}
+		return api.Response{Success: false, Message: "Falta el identificador de la peticion"}
 	}
 	if req.ReviewStatus != api.QueryApproved && req.ReviewStatus != api.QueryDenied {
-		return api.Response{Success: false, Message: "Estado de revisión no válido"}
+		return api.Response{Success: false, Message: "Estado de revision no valido"}
 	}
 
 	var query api.StatsRequest
 	if err := getJSON(s.db, queriesNamespace, []byte(req.QueryID), &query); err != nil {
-		return api.Response{Success: false, Message: "La petición no existe"}
+		return api.Response{Success: false, Message: "La peticion no existe"}
 	}
 	if query.Status != api.QueryPending {
-		return api.Response{Success: false, Message: "La petición ya fue revisada"}
+		return api.Response{Success: false, Message: "La peticion ya fue revisada"}
 	}
 
 	query.Status = req.ReviewStatus
@@ -456,15 +525,15 @@ func (s *server) reviewQueryRequest(req api.Request) api.Response {
 	query.ReviewedAt = time.Now().UTC().Format(time.RFC3339)
 	query.ReviewComment = strings.TrimSpace(req.ReviewComment)
 	if err := putJSON(s.db, queriesNamespace, []byte(query.ID), query); err != nil {
-		return api.Response{Success: false, Message: "Error al actualizar la petición"}
+		return api.Response{Success: false, Message: "Error al actualizar la peticion"}
 	}
-	return api.Response{Success: true, Message: "Petición revisada correctamente"}
+	return api.Response{Success: true, Message: "Peticion revisada correctamente"}
 }
 
 func (s *server) setConsent(req api.Request) api.Response {
 	session, ok := s.authenticate(req.Token)
 	if !ok {
-		return api.Response{Success: false, Message: "Token inválido o sesión expirada"}
+		return api.Response{Success: false, Message: "Token invalido o sesion expirada"}
 	}
 	if session.Role != api.RolePatient {
 		return api.Response{Success: false, Message: "Solo un paciente puede modificar este permiso"}
@@ -492,12 +561,12 @@ func (s *server) setConsent(req api.Request) api.Response {
 func (s *server) logoutUser(req api.Request) api.Response {
 	_, ok := s.authenticate(req.Token)
 	if !ok {
-		return api.Response{Success: false, Message: "Token inválido o sesión expirada"}
+		return api.Response{Success: false, Message: "Token invalido o sesion expirada"}
 	}
 	if err := s.db.Delete(sessionsNamespace, []byte(sessionKey(req.Token))); err != nil {
-		return api.Response{Success: false, Message: "Error al cerrar sesión"}
+		return api.Response{Success: false, Message: "Error al cerrar sesion"}
 	}
-	return api.Response{Success: true, Message: "Sesión cerrada correctamente"}
+	return api.Response{Success: true, Message: "Sesion cerrada correctamente"}
 }
 
 func (s *server) computeStats(query api.StatsRequest) ([]api.StatsRow, error) {
@@ -512,7 +581,7 @@ func (s *server) computeStats(query api.StatsRequest) ([]api.StatsRow, error) {
 		if err := getJSON(s.db, recordsNamespace, key, &record); err != nil {
 			return nil, err
 		}
-		patient, err := s.loadUser(record.PatientUsername)
+		patient, err := s.loadPatientByID(record.PatientID)
 		if err != nil || patient.Role != api.RolePatient || !patient.DataUseAllowed {
 			continue
 		}
@@ -595,6 +664,177 @@ func (s *server) loadSession(token string) (sessionRecord, error) {
 	return session, nil
 }
 
+func (s *server) loadPatientByID(patientID string) (userRecord, error) {
+	username, err := s.findUsernameByPatientID(patientID)
+	if err != nil {
+		return userRecord{}, err
+	}
+	return s.loadUser(username)
+}
+
+func (s *server) findUsernameByPatientID(patientID string) (string, error) {
+	patientID = strings.TrimSpace(patientID)
+	if patientID == "" {
+		return "", store.ErrKeyNotFound
+	}
+
+	raw, err := s.db.Get(patientIDsNamespace, []byte(patientID))
+	if err == nil {
+		return string(raw), nil
+	}
+	if !errors.Is(err, store.ErrNamespaceNotFound) && !errors.Is(err, store.ErrKeyNotFound) {
+		return "", err
+	}
+
+	keys, err := s.db.ListKeys(usersNamespace)
+	if err != nil {
+		return "", err
+	}
+	for _, key := range keys {
+		var user userRecord
+		if err := getJSON(s.db, usersNamespace, key, &user); err != nil {
+			continue
+		}
+		if user.Role == api.RolePatient && user.PatientID == patientID {
+			_ = s.db.Put(patientIDsNamespace, []byte(patientID), []byte(user.Username))
+			return user.Username, nil
+		}
+	}
+	return "", store.ErrKeyNotFound
+}
+
+func (s *server) ensurePatientIdentifiers() error {
+	keys, err := s.db.ListKeys(usersNamespace)
+	if err != nil {
+		if errors.Is(err, store.ErrNamespaceNotFound) {
+			return nil
+		}
+		return err
+	}
+
+	usersByUsername := make(map[string]userRecord, len(keys))
+	patientsWithoutID := make([]patientUser, 0)
+	maxPatientIndex := 0
+
+	for _, key := range keys {
+		var user userRecord
+		if err := getJSON(s.db, usersNamespace, key, &user); err != nil {
+			return err
+		}
+		usersByUsername[user.Username] = user
+		if user.Role != api.RolePatient {
+			continue
+		}
+		if idx, ok := parsePatientID(user.PatientID); ok && idx > maxPatientIndex {
+			maxPatientIndex = idx
+		}
+		if strings.TrimSpace(user.PatientID) == "" {
+			patientsWithoutID = append(patientsWithoutID, patientUser{key: key, user: user})
+			continue
+		}
+		if err := s.db.Put(patientIDsNamespace, []byte(user.PatientID), []byte(user.Username)); err != nil {
+			return err
+		}
+	}
+
+	sort.Slice(patientsWithoutID, func(i, j int) bool {
+		if patientsWithoutID[i].user.CreatedAt == patientsWithoutID[j].user.CreatedAt {
+			return patientsWithoutID[i].user.Username < patientsWithoutID[j].user.Username
+		}
+		return patientsWithoutID[i].user.CreatedAt < patientsWithoutID[j].user.CreatedAt
+	})
+
+	for _, patient := range patientsWithoutID {
+		maxPatientIndex++
+		patient.user.PatientID = formatPatientID(maxPatientIndex)
+		if err := putJSON(s.db, usersNamespace, patient.key, patient.user); err != nil {
+			return err
+		}
+		if err := s.db.Put(patientIDsNamespace, []byte(patient.user.PatientID), []byte(patient.user.Username)); err != nil {
+			return err
+		}
+		usersByUsername[patient.user.Username] = patient.user
+	}
+
+	return s.migrateLegacyRecords(usersByUsername)
+}
+
+func (s *server) migrateLegacyRecords(usersByUsername map[string]userRecord) error {
+	keys, err := s.db.ListKeys(recordsNamespace)
+	if err != nil {
+		if errors.Is(err, store.ErrNamespaceNotFound) {
+			return nil
+		}
+		return err
+	}
+
+	for _, key := range keys {
+		raw, err := s.db.Get(recordsNamespace, key)
+		if err != nil {
+			return err
+		}
+
+		var legacy legacyStoredRecord
+		if err := json.Unmarshal(raw, &legacy); err != nil {
+			return err
+		}
+
+		if strings.TrimSpace(legacy.PatientID) != "" && strings.TrimSpace(legacy.PatientUsername) == "" {
+			continue
+		}
+
+		if strings.TrimSpace(legacy.PatientID) == "" {
+			patient, ok := usersByUsername[strings.TrimSpace(legacy.PatientUsername)]
+			if !ok || patient.Role != api.RolePatient || patient.PatientID == "" {
+				continue
+			}
+			legacy.PatientID = patient.PatientID
+		}
+
+		record := api.AnonymizedRecord{
+			ID:             legacy.ID,
+			Classification: legacy.Classification,
+			AgeRange:       legacy.AgeRange,
+			Sex:            legacy.Sex,
+			PatientID:      legacy.PatientID,
+			CreatedAt:      legacy.CreatedAt,
+			UploadedBy:     legacy.UploadedBy,
+		}
+		if err := record.Validate(); err != nil {
+			return err
+		}
+		if err := putJSON(s.db, recordsNamespace, key, record); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *server) allocateNextPatientID() (string, error) {
+	keys, err := s.db.ListKeys(usersNamespace)
+	if err != nil {
+		if errors.Is(err, store.ErrNamespaceNotFound) {
+			return formatPatientID(1), nil
+		}
+		return "", err
+	}
+
+	maxPatientIndex := 0
+	for _, key := range keys {
+		var user userRecord
+		if err := getJSON(s.db, usersNamespace, key, &user); err != nil {
+			return "", err
+		}
+		if user.Role != api.RolePatient {
+			continue
+		}
+		if idx, ok := parsePatientID(user.PatientID); ok && idx > maxPatientIndex {
+			maxPatientIndex = idx
+		}
+	}
+	return formatPatientID(maxPatientIndex + 1), nil
+}
+
 func hasRole(db store.Store, role api.UserRole) bool {
 	keys, err := db.ListKeys(usersNamespace)
 	if err != nil {
@@ -657,6 +897,22 @@ func getJSON(db store.Store, namespace string, key []byte, dest any) error {
 		return err
 	}
 	return json.Unmarshal(raw, dest)
+}
+
+func parsePatientID(patientID string) (int, bool) {
+	patientID = strings.TrimSpace(patientID)
+	if !strings.HasPrefix(patientID, "id") {
+		return 0, false
+	}
+	value, err := strconv.Atoi(strings.TrimPrefix(patientID, "id"))
+	if err != nil || value <= 0 {
+		return 0, false
+	}
+	return value, true
+}
+
+func formatPatientID(index int) string {
+	return fmt.Sprintf("id%d", index)
 }
 
 func ageRangeOrder(ageRange string) int {

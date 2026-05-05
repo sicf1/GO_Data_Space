@@ -1,5 +1,5 @@
 /*
-'sprout' es una base para el desarrollo de prácticas en clase con Go.
+Sprout es una base para el desarrollo de practicas en clase con Go.
 
 Se puede compilar con "go build" en el directorio donde resida main.go
 o "go build -o nombre" para que el ejecutable tenga un nombre distinto.
@@ -9,6 +9,7 @@ package main
 import (
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 
 	"sprout/pkg/client"
@@ -23,27 +24,33 @@ func main() {
 		mainLog.Fatalf("No se ha podido crear la carpeta de datos: %v", err)
 	}
 
-	masterPassphrase, err := ui.ReadPassword("Contraseña maestra de cifrado")
-	if err != nil || masterPassphrase == "" {
-		mainLog.Fatalf("No se ha podido leer la contraseña maestra")
+	profiles := client.AvailableProfiles()
+	options := make([]string, 0, len(profiles))
+	for _, profile := range profiles {
+		options = append(options, profile.Label)
+	}
+	selectedProfile := profiles[ui.PrintMenu("Selecciona la entidad cliente", options)-1]
+
+	clientMasterPassphrase, err := ui.ReadPassword("Clave maestra de " + selectedProfile.Label)
+	if err != nil || clientMasterPassphrase == "" {
+		mainLog.Fatalf("No se ha podido leer la clave maestra de %s", selectedProfile.Label)
+	}
+
+	serverMasterPassphrase, err := ui.ReadPassword("Clave maestra del servidor compartido")
+	if err != nil || serverMasterPassphrase == "" {
+		mainLog.Fatalf("No se ha podido leer la clave maestra del servidor")
 	}
 
 	serverCfg := server.Config{
 		Addr:               ":8443",
-		DBPath:             "data/server.db",
-		SaltPath:           "data/master.salt",
-		TLSCertPath:        "data/tls/server.crt",
-		TLSKeyPath:         "data/tls/server.key",
-		MasterPassphrase:   masterPassphrase,
+		DBPath:             filepath.Join("data", "server", "server.db"),
+		SaltPath:           filepath.Join("data", "server", "master.salt"),
+		TLSCertPath:        filepath.Join("data", "server", "tls", "server.crt"),
+		TLSKeyPath:         filepath.Join("data", "server", "tls", "server.key"),
+		MasterPassphrase:   serverMasterPassphrase,
 		SessionIdleTimeout: 30 * time.Minute,
 	}
-	clientCfg := client.Config{
-		ServerURL:        "https://localhost:8443/api",
-		TLSCertPath:      "data/tls/server.crt",
-		LocalDBPath:      "data/client.db",
-		LocalSaltPath:    "data/client.salt",
-		MasterPassphrase: masterPassphrase,
-	}
+	clientCfg := client.BuildProfileConfig(selectedProfile, clientMasterPassphrase)
 
 	needsAdmin, err := server.NeedsInitialAdmin(serverCfg)
 	if err != nil {
@@ -52,9 +59,9 @@ func main() {
 	if needsAdmin {
 		mainLog.Println("No existe administrador inicial; se va a crear ahora.")
 		adminUser := ui.ReadInput("Usuario administrador inicial")
-		adminPassword, err := ui.ReadPassword("Contraseña del administrador inicial")
+		adminPassword, err := ui.ReadPassword("Contrasena del administrador inicial")
 		if err != nil || adminPassword == "" {
-			mainLog.Fatalf("No se ha podido leer la contraseña del administrador inicial")
+			mainLog.Fatalf("No se ha podido leer la contrasena del administrador inicial")
 		}
 		if err := server.BootstrapInitialAdmin(serverCfg, adminUser, adminPassword); err != nil {
 			mainLog.Fatalf("No se ha podido crear el administrador inicial: %v", err)
@@ -74,8 +81,8 @@ func main() {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	mainLog.Println("Iniciando cliente...")
+	mainLog.Printf("Iniciando %s...\n", selectedProfile.Label)
 	if err := client.Run(clientCfg); err != nil {
-		mainLog.Fatalf("Error del cliente: %v", err)
+		mainLog.Fatalf("Error de %s: %v", selectedProfile.Label, err)
 	}
 }

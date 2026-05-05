@@ -1,75 +1,81 @@
 # Sprout - Data Space Seguro en Go
 
-Este proyecto implementa una versión funcional de la práctica de `Seguridad y Confidencialidad`: un `data space` sanitario reducido con cliente de terminal, servidor HTTPS, base de datos cifrada y control de acceso por roles.
+Este proyecto implementa una version funcional de la practica de `Seguridad y Confidencialidad`: un `data space` sanitario reducido con servidor HTTPS, base de datos cifrada y clientes de terminal por entidad.
 
-## Ejecución
+## Ejecucion
 
-1. Lanza la aplicación:
+1. Lanza la aplicacion:
    ```bash
    go run main.go
    ```
-2. Introduce la contraseña maestra de cifrado.
-3. En el primer arranque se solicitará crear el administrador inicial.
-4. Desde el menú del administrador se podrán dar de alta médicos, investigadores y pacientes.
+2. Selecciona la entidad cliente:
+   - `hospital1`
+   - `hospital2`
+   - `hospital3`
+   - `centro de investigacion1`
+3. Introduce la clave maestra de la entidad seleccionada.
+4. Introduce la clave maestra del servidor compartido.
+5. En el primer arranque se solicitara crear el administrador inicial.
+
+## Cambios principales
+
+- Cada paciente recibe un seudonimo estable `id1`, `id2`, `id3`, ... segun su orden de creacion.
+- Los registros anonimizados que llegan al servidor usan `patientId` en lugar del nombre real del paciente.
+- Cada entidad cliente guarda su informacion local en una ruta propia:
+  - `data/clients/hospital1`
+  - `data/clients/hospital2`
+  - `data/clients/hospital3`
+  - `data/clients/centro_investigacion1`
+- El servidor compartido guarda su informacion en `data/server`.
 
 ## Funcionalidades Data Space
 
-- ✅ Mecanismo para armonizar datos de salud en un formato XML propio y sencillo.
-- ✅ Mecanismo para anonimizar los datos antes de subirlos al servidor.
-- ✅ El cliente almacena localmente los datos armonizados sin anonimizar.
-- ✅ El servidor almacena los registros anonimizados y protegidos.
-- ✅ El servidor devuelve estadísticas agregadas por clasificación y rango de edad para consultas autorizadas.
+- Armonizacion de datos de salud en un formato XML local.
+- Anonimizacion antes de subir registros al servidor.
+- Almacenamiento local cifrado de datos no anonimizados por entidad.
+- Almacenamiento servidor cifrado de registros anonimizados.
+- Estadisticas agregadas por clasificacion y rango de edad para consultas autorizadas.
 
-### Menús por rol
+## Menus por rol
 
-- ✅ Administrador:
+- Administrador:
   - autorizar o denegar peticiones de consulta
-  - dar de alta médico
+  - dar de alta medico
   - dar de alta investigador
   - dar de alta paciente
-- ✅ Paciente:
+- Paciente:
   - revocar permisos de uso de datos
   - restablecer permisos de uso de datos
-- ✅ Médico:
+- Medico:
   - introducir datos de paciente
   - listar registros locales
   - subir registro anonimizado
-- ✅ Investigador:
-  - hacer petición de consulta de datos
+- Investigador:
+  - hacer peticion de consulta de datos
   - ver consultas aprobadas
   - ver consultas denegadas
 
 ## Medidas de seguridad
 
-- ✅ Autentificación segura mediante contraseñas con `Argon2id` y sal aleatoria por usuario.
-- ✅ Compresión y cifrado de la base de datos con `gzip + AES-256-GCM`.
-- ✅ Gestión de la clave maestra fuera del código, solicitándola al arrancar y derivando la clave con `Argon2id`.
-- ✅ Comunicación segura cliente-servidor mediante `HTTPS` con certificado autofirmado para `localhost`.
-- ✅ Sesiones seguras con token aleatorio y expiración por inactividad.
-
-## Estado de extras
-
-- <span style="color:red">Extra</span> ✅ Expiración de sesiones por inactividad.
-- <span style="color:red">Extra</span> ✅ Flujo de aprobación de consultas para investigadores.
-- <span style="color:red">Extra</span> ✅ Revocación dinámica del uso de datos por parte del paciente.
+- Autentificacion segura mediante contraseñas con `Argon2id` y sal aleatoria por usuario.
+- Compresion y cifrado de la base de datos con `gzip + AES-256-GCM`.
+- Gestion de claves maestras fuera del codigo.
+- Comunicacion segura cliente-servidor mediante `HTTPS` con certificado autofirmado para `localhost`.
+- Sesiones seguras con token aleatorio y expiracion por inactividad.
 
 ## Estructura principal
 
-- `main.go`: arranque, contraseña maestra y bootstrap del administrador inicial.
+- `main.go`: seleccion de entidad, lectura de claves maestras y arranque conjunto.
 - `pkg/api`: tipos compartidos, roles, registros y peticiones de consulta.
-- `pkg/client`: menús por rol, almacenamiento local seguro y cliente HTTPS.
-- `pkg/server`: HTTPS, autenticación, autorización, consentimiento y estadísticas.
-- `pkg/store`: `bbolt` y decorador de cifrado/compresión.
+- `pkg/client`: perfiles de entidad, menus por rol, almacenamiento local seguro y cliente HTTPS.
+- `pkg/server`: HTTPS, autenticacion, autorizacion, consentimiento, migracion de IDs y estadisticas.
+- `pkg/store`: `bbolt` y decorador de cifrado/compresion.
+- `scripts/inspect_db.go`: inspeccion de la base de datos del servidor o de una entidad cliente.
 
-## Validación
+## Validacion
 
-- Tests:
-  ```bash
-  go test ./...
-  ```
-- La suite actual cubre:
-  - roundtrip y protección del `SecureStore`
-  - detección de clave maestra incorrecta
-  - flujo completo administrador/médico/investigador/paciente
-  - expiración de sesión
-  - robustez básica del endpoint JSON
+```bash
+go test ./...
+```
+
+La suite cubre almacenamiento cifrado, clave maestra incorrecta, flujo completo por roles, expiracion de sesion, robustez JSON y migracion de pacientes legacy a `idN`.

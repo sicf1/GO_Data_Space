@@ -1,5 +1,5 @@
-// El paquete client contiene la lógica de interacción con el usuario
-// así como de comunicación con el servidor.
+// El paquete client contiene la logica de interaccion con el usuario
+// asi como de comunicacion con el servidor.
 package client
 
 import (
@@ -23,6 +23,7 @@ import (
 type client struct {
 	log            *log.Logger
 	serverURL      string
+	profileLabel   string
 	currentUser    string
 	currentRole    api.UserRole
 	authToken      string
@@ -44,8 +45,9 @@ func Run(cfg Config) error {
 	defer localStore.Close()
 
 	c := &client{
-		log:       log.New(os.Stdout, "[cli] ", log.LstdFlags),
-		serverURL: cfg.ServerURL,
+		log:          log.New(os.Stdout, "[cli] ", log.LstdFlags),
+		serverURL:    cfg.ServerURL,
+		profileLabel: cfg.ProfileLabel,
 		httpClient: &http.Client{
 			Timeout:   5 * time.Second,
 			Transport: httpClient.Transport,
@@ -82,14 +84,14 @@ func (c *client) runLoop() {
 		ui.ClearScreen()
 
 		if c.currentUser == "" {
-			switch ui.PrintMenu("Menú", []string{
-				"Iniciar sesión",
+			switch ui.PrintMenu(c.menuTitle("Inicio"), []string{
+				"Iniciar sesion",
 				"Salir",
 			}) {
 			case 1:
 				c.loginUser()
 			case 2:
-				c.log.Println("Saliendo del cliente...")
+				c.log.Printf("Saliendo de %s...\n", c.profileLabel)
 				c.exitRequested = true
 			}
 			ui.Pause("Pulsa [Enter] para continuar...")
@@ -106,7 +108,7 @@ func (c *client) runLoop() {
 		case api.RolePatient:
 			c.runPatientMenu()
 		default:
-			fmt.Println("Rol no reconocido. Cerrando sesión.")
+			fmt.Println("Rol no reconocido. Cerrando sesion.")
 			c.clearSession()
 			ui.Pause("Pulsa [Enter] para continuar...")
 		}
@@ -114,13 +116,12 @@ func (c *client) runLoop() {
 }
 
 func (c *client) runAdminMenu() {
-	title := fmt.Sprintf("Administrador (%s)", c.currentUser)
-	switch ui.PrintMenu(title, []string{
-		"Autorizar petición",
-		"Dar de alta médico",
+	switch ui.PrintMenu(c.menuTitle(fmt.Sprintf("Administrador (%s)", c.currentUser)), []string{
+		"Autorizar peticion",
+		"Dar de alta medico",
 		"Dar de alta investigador",
 		"Dar de alta paciente",
-		"Cerrar sesión",
+		"Cerrar sesion",
 		"Salir",
 	}) {
 	case 1:
@@ -134,19 +135,18 @@ func (c *client) runAdminMenu() {
 	case 5:
 		c.logoutUser()
 	case 6:
-		c.log.Println("Saliendo del cliente...")
+		c.log.Printf("Saliendo de %s...\n", c.profileLabel)
 		c.exitRequested = true
 	}
 	ui.Pause("Pulsa [Enter] para continuar...")
 }
 
 func (c *client) runDoctorMenu() {
-	title := fmt.Sprintf("Médico (%s)", c.currentUser)
-	switch ui.PrintMenu(title, []string{
+	switch ui.PrintMenu(c.menuTitle(fmt.Sprintf("Medico (%s)", c.currentUser)), []string{
 		"Introducir datos de paciente",
 		"Listar registros locales",
 		"Subir registro anonimizado",
-		"Cerrar sesión",
+		"Cerrar sesion",
 		"Salir",
 	}) {
 	case 1:
@@ -158,19 +158,18 @@ func (c *client) runDoctorMenu() {
 	case 4:
 		c.logoutUser()
 	case 5:
-		c.log.Println("Saliendo del cliente...")
+		c.log.Printf("Saliendo de %s...\n", c.profileLabel)
 		c.exitRequested = true
 	}
 	ui.Pause("Pulsa [Enter] para continuar...")
 }
 
 func (c *client) runResearcherMenu() {
-	title := fmt.Sprintf("Investigador (%s)", c.currentUser)
-	switch ui.PrintMenu(title, []string{
-		"Hacer petición de consulta de datos",
+	switch ui.PrintMenu(c.menuTitle(fmt.Sprintf("Investigador (%s)", c.currentUser)), []string{
+		"Hacer peticion de consulta de datos",
 		"Ver consultas aprobadas",
 		"Ver consultas denegadas",
-		"Cerrar sesión",
+		"Cerrar sesion",
 		"Salir",
 	}) {
 	case 1:
@@ -182,21 +181,20 @@ func (c *client) runResearcherMenu() {
 	case 4:
 		c.logoutUser()
 	case 5:
-		c.log.Println("Saliendo del cliente...")
+		c.log.Printf("Saliendo de %s...\n", c.profileLabel)
 		c.exitRequested = true
 	}
 	ui.Pause("Pulsa [Enter] para continuar...")
 }
 
 func (c *client) runPatientMenu() {
-	title := fmt.Sprintf("Paciente (%s)", c.currentUser)
 	actionLabel := "Revocar permisos uso de datos"
 	if c.consentGranted != nil && !*c.consentGranted {
 		actionLabel = "Restablecer permisos uso de datos"
 	}
-	switch ui.PrintMenu(title, []string{
+	switch ui.PrintMenu(c.menuTitle(fmt.Sprintf("Paciente (%s)", c.currentUser)), []string{
 		actionLabel,
-		"Cerrar sesión",
+		"Cerrar sesion",
 		"Salir",
 	}) {
 	case 1:
@@ -204,7 +202,7 @@ func (c *client) runPatientMenu() {
 	case 2:
 		c.logoutUser()
 	case 3:
-		c.log.Println("Saliendo del cliente...")
+		c.log.Printf("Saliendo de %s...\n", c.profileLabel)
 		c.exitRequested = true
 	}
 	ui.Pause("Pulsa [Enter] para continuar...")
@@ -212,11 +210,11 @@ func (c *client) runPatientMenu() {
 
 func (c *client) createUser(role api.UserRole) {
 	ui.ClearScreen()
-	fmt.Printf("** Alta de %s **\n", role)
+	fmt.Printf("** Alta de %s en %s **\n", role, c.profileLabel)
 	username := ui.ReadInput("Nombre de usuario")
-	password, err := ui.ReadPassword("Contraseña")
+	password, err := ui.ReadPassword("Contrasena")
 	if err != nil {
-		c.log.Println("No se ha podido leer la contraseña:", err)
+		c.log.Println("No se ha podido leer la contrasena:", err)
 		return
 	}
 	res := c.sendRequest(api.Request{
@@ -226,18 +224,18 @@ func (c *client) createUser(role api.UserRole) {
 		Role:     role,
 		Token:    c.authToken,
 	})
-	fmt.Println("Éxito:", res.Success)
+	fmt.Println("Exito:", res.Success)
 	fmt.Println("Mensaje:", res.Message)
 }
 
 func (c *client) loginUser() {
 	ui.ClearScreen()
-	fmt.Println("** Inicio de sesión **")
+	fmt.Printf("** Inicio de sesion en %s **\n", c.profileLabel)
 
 	username := ui.ReadInput("Nombre de usuario")
-	password, err := ui.ReadPassword("Contraseña")
+	password, err := ui.ReadPassword("Contrasena")
 	if err != nil {
-		c.log.Println("No se ha podido leer la contraseña:", err)
+		c.log.Println("No se ha podido leer la contrasena:", err)
 		return
 	}
 	res := c.sendRequest(api.Request{
@@ -245,7 +243,7 @@ func (c *client) loginUser() {
 		Username: username,
 		Password: password,
 	})
-	fmt.Println("Éxito:", res.Success)
+	fmt.Println("Exito:", res.Success)
 	fmt.Println("Mensaje:", res.Message)
 	if !res.Success {
 		return
@@ -261,7 +259,7 @@ func (c *client) logoutUser() {
 		Action: api.ActionLogout,
 		Token:  c.authToken,
 	})
-	fmt.Println("Éxito:", res.Success)
+	fmt.Println("Exito:", res.Success)
 	fmt.Println("Mensaje:", res.Message)
 	if res.Success {
 		c.clearSession()
@@ -277,17 +275,24 @@ func (c *client) clearSession() {
 
 func (c *client) createLocalRecord() {
 	ui.ClearScreen()
-	fmt.Println("** Introducir datos de paciente **")
+	fmt.Printf("** Introducir datos de paciente en %s **\n", c.profileLabel)
 	fmt.Println("Clasificaciones disponibles:", shortClassificationOptions())
 	fmt.Println("Sexos permitidos: M, F, X, ND")
 
+	patientUsername := ui.ReadInput("Usuario paciente")
+	patientID, ok := c.lookupPatientID(patientUsername)
+	if !ok {
+		return
+	}
+
 	input := api.RecordInput{
-		PatientUsername: ui.ReadInput("Usuario paciente"),
-		Classification:  ui.ReadInput("Clasificación"),
+		PatientID:       patientID,
+		PatientUsername: patientUsername,
+		Classification:  ui.ReadInput("Clasificacion"),
 		Age:             ui.ReadInt("Edad del paciente"),
 		Sex:             ui.ReadInput("Sexo"),
 		PatientAlias:    ui.ReadInput("Alias local del paciente"),
-		Observation:     ui.ReadMultiline("Observaciones médicas"),
+		Observation:     ui.ReadMultiline("Observaciones medicas"),
 	}
 	record, err := api.NewLocalRecord(input, c.currentUser, time.Now())
 	if err != nil {
@@ -298,12 +303,25 @@ func (c *client) createLocalRecord() {
 		fmt.Println("No se ha podido guardar el registro local:", err)
 		return
 	}
-	fmt.Println("Registro local armonizado guardado con ID:", record.ID)
+	fmt.Printf("Registro local guardado con ID=%s y paciente anonimizado=%s\n", record.ID, record.PatientID)
+}
+
+func (c *client) lookupPatientID(username string) (string, bool) {
+	res := c.sendRequest(api.Request{
+		Action:   api.ActionValidatePatient,
+		Token:    c.authToken,
+		Username: username,
+	})
+	if res.Success {
+		return res.PatientID, true
+	}
+	fmt.Println("No se puede crear el registro:", res.Message)
+	return "", false
 }
 
 func (c *client) listLocalRecords() {
 	ui.ClearScreen()
-	fmt.Println("** Registros locales **")
+	fmt.Printf("** Registros locales de %s **\n", c.profileLabel)
 
 	records, err := listLocalRecords(c.localStore, c.currentUser)
 	if err != nil {
@@ -315,8 +333,8 @@ func (c *client) listLocalRecords() {
 		return
 	}
 	for i, record := range records {
-		fmt.Printf("%d. ID=%s | paciente=%s | clasificación=%s | rango=%s | sexo=%s\n",
-			i+1, record.ID, record.PatientUsername, record.Classification, record.AgeRange, record.Sex)
+		fmt.Printf("%d. ID=%s | paciente=%s | usuario=%s | clasificacion=%s | rango=%s | sexo=%s\n",
+			i+1, record.ID, record.PatientID, record.PatientUsername, record.Classification, record.AgeRange, record.Sex)
 	}
 }
 
@@ -337,27 +355,40 @@ func (c *client) uploadLocalRecord() {
 	options := make([]string, 0, len(records))
 	for _, record := range records {
 		options = append(options, fmt.Sprintf("%s | paciente=%s | %s | %s",
-			record.ID, record.PatientUsername, record.Classification, record.AgeRange))
+			record.ID, emptyLabel(record.PatientID, "sin-id"), record.Classification, record.AgeRange))
 	}
 	choice := ui.PrintMenu("Selecciona un registro", options)
 	selected := records[choice-1]
+
+	if strings.TrimSpace(selected.PatientID) == "" {
+		patientID, ok := c.lookupPatientID(selected.PatientUsername)
+		if !ok {
+			return
+		}
+		selected.PatientID = patientID
+		if err := storeLocalRecord(c.localStore, selected); err != nil {
+			fmt.Println("No se ha podido actualizar el identificador anonimizado local:", err)
+			return
+		}
+	}
+
 	res := c.sendRequest(api.Request{
 		Action: api.ActionUploadRecord,
 		Token:  c.authToken,
 		Record: ptrAnonymized(selected.ToAnonymized()),
 	})
-	fmt.Println("Éxito:", res.Success)
+	fmt.Println("Exito:", res.Success)
 	fmt.Println("Mensaje:", res.Message)
 }
 
 func (c *client) createQueryRequest() {
 	ui.ClearScreen()
-	fmt.Println("** Nueva petición de consulta **")
-	fmt.Println("Deja vacíos los filtros para consultar todo el conjunto disponible.")
+	fmt.Println("** Nueva peticion de consulta **")
+	fmt.Println("Deja vacios los filtros para consultar todo el conjunto disponible.")
 	fmt.Println("Clasificaciones disponibles:", shortClassificationOptions())
 	fmt.Println("Rangos de edad: 0-17, 18-35, 36-50, 51-65, 66+")
 
-	classification := strings.TrimSpace(ui.ReadInput("Filtrar por clasificación"))
+	classification := strings.TrimSpace(ui.ReadInput("Filtrar por clasificacion"))
 	ageRange := strings.TrimSpace(ui.ReadInput("Filtrar por rango de edad"))
 	var query *api.StatsQuery
 	if classification != "" || ageRange != "" {
@@ -368,7 +399,7 @@ func (c *client) createQueryRequest() {
 		Token:  c.authToken,
 		Query:  query,
 	})
-	fmt.Println("Éxito:", res.Success)
+	fmt.Println("Exito:", res.Success)
 	fmt.Println("Mensaje:", res.Message)
 }
 
@@ -380,7 +411,7 @@ func (c *client) listQueries(status api.QueryStatus) {
 		Token:        c.authToken,
 		StatusFilter: status,
 	})
-	fmt.Println("Éxito:", res.Success)
+	fmt.Println("Exito:", res.Success)
 	fmt.Println("Mensaje:", res.Message)
 	if !res.Success {
 		return
@@ -390,7 +421,7 @@ func (c *client) listQueries(status api.QueryStatus) {
 		return
 	}
 	for _, query := range res.QueryRequests {
-		fmt.Printf("- %s | clasificación=%s | rango=%s | estado=%s\n",
+		fmt.Printf("- %s | clasificacion=%s | rango=%s | estado=%s\n",
 			query.ID, emptyLabel(query.Classification, "todas"), emptyLabel(query.AgeRange, "todos"), query.Status)
 		if query.ReviewComment != "" {
 			fmt.Println("  Comentario:", query.ReviewComment)
@@ -403,7 +434,7 @@ func (c *client) listQueries(status api.QueryStatus) {
 
 func (c *client) reviewPendingQuery() {
 	ui.ClearScreen()
-	fmt.Println("** Autorizar o denegar petición **")
+	fmt.Println("** Autorizar o denegar peticion **")
 
 	res := c.sendRequest(api.Request{
 		Action:       api.ActionListQueryRequests,
@@ -421,18 +452,18 @@ func (c *client) reviewPendingQuery() {
 
 	options := make([]string, 0, len(res.QueryRequests))
 	for _, query := range res.QueryRequests {
-		options = append(options, fmt.Sprintf("%s | investigador=%s | clasificación=%s | rango=%s",
+		options = append(options, fmt.Sprintf("%s | investigador=%s | clasificacion=%s | rango=%s",
 			query.ID, query.RequestedBy, emptyLabel(query.Classification, "todas"), emptyLabel(query.AgeRange, "todos")))
 	}
-	choice := ui.PrintMenu("Selecciona una petición", options)
+	choice := ui.PrintMenu("Selecciona una peticion", options)
 	selected := res.QueryRequests[choice-1]
 
-	approve := ui.Confirm("¿Aprobar la petición seleccionada?")
+	approve := ui.Confirm("Aprobar la peticion seleccionada?")
 	status := api.QueryDenied
 	if approve {
 		status = api.QueryApproved
 	}
-	comment := ui.ReadInput("Comentario de revisión")
+	comment := ui.ReadInput("Comentario de revision")
 	reviewRes := c.sendRequest(api.Request{
 		Action:        api.ActionReviewQueryRequest,
 		Token:         c.authToken,
@@ -440,7 +471,7 @@ func (c *client) reviewPendingQuery() {
 		ReviewStatus:  status,
 		ReviewComment: comment,
 	})
-	fmt.Println("Éxito:", reviewRes.Success)
+	fmt.Println("Exito:", reviewRes.Success)
 	fmt.Println("Mensaje:", reviewRes.Message)
 }
 
@@ -457,7 +488,7 @@ func (c *client) toggleConsent() {
 		Token:          c.authToken,
 		ConsentGranted: &newValue,
 	})
-	fmt.Println("Éxito:", res.Success)
+	fmt.Println("Exito:", res.Success)
 	fmt.Println("Mensaje:", res.Message)
 	if res.Success {
 		c.consentGranted = res.ConsentGranted
@@ -467,34 +498,38 @@ func (c *client) toggleConsent() {
 func (c *client) sendRequest(req api.Request) api.Response {
 	jsonData, err := json.Marshal(req)
 	if err != nil {
-		c.log.Println("No se ha podido serializar la petición JSON:", err)
+		c.log.Println("No se ha podido serializar la peticion JSON:", err)
 		return api.Response{Success: false, Message: "Error interno del cliente"}
 	}
 
 	httpReq, err := http.NewRequest(http.MethodPost, c.serverURL, bytes.NewBuffer(jsonData))
 	if err != nil {
-		c.log.Println("No se ha podido construir la petición HTTPS:", err)
+		c.log.Println("No se ha podido construir la peticion HTTPS:", err)
 		return api.Response{Success: false, Message: "Error interno del cliente"}
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return api.Response{Success: false, Message: "Error de conexión"}
+		return api.Response{Success: false, Message: "Error de conexion"}
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		c.log.Println("No se ha podido leer la respuesta:", err)
-		return api.Response{Success: false, Message: "Respuesta inválida del servidor"}
+		return api.Response{Success: false, Message: "Respuesta invalida del servidor"}
 	}
 	var res api.Response
 	if err := json.Unmarshal(body, &res); err != nil {
 		c.log.Println("No se ha podido descodificar la respuesta JSON:", err)
-		return api.Response{Success: false, Message: "Respuesta inválida del servidor"}
+		return api.Response{Success: false, Message: "Respuesta invalida del servidor"}
 	}
 	return res
+}
+
+func (c *client) menuTitle(section string) string {
+	return fmt.Sprintf("%s\nEntidad: %s", section, c.profileLabel)
 }
 
 func ptrAnonymized(record api.AnonymizedRecord) *api.AnonymizedRecord {

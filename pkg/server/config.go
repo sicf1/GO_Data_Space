@@ -17,16 +17,16 @@ func (c Config) withDefaults() Config {
 		c.Addr = ":8443"
 	}
 	if c.DBPath == "" {
-		c.DBPath = "data/server.db"
+		c.DBPath = "data/server/server.db"
 	}
 	if c.SaltPath == "" {
-		c.SaltPath = "data/master.salt"
+		c.SaltPath = "data/server/master.salt"
 	}
 	if c.TLSCertPath == "" {
-		c.TLSCertPath = "data/tls/server.crt"
+		c.TLSCertPath = "data/server/tls/server.crt"
 	}
 	if c.TLSKeyPath == "" {
-		c.TLSKeyPath = "data/tls/server.key"
+		c.TLSKeyPath = "data/server/tls/server.key"
 	}
 	if c.SessionIdleTimeout == 0 {
 		c.SessionIdleTimeout = 30 * time.Minute

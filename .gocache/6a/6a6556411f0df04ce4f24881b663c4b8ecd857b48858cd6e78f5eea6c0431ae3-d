@@ -1,0 +1,5 @@
+./bbolt.go
+./secure.go
+./store.go
+./bbolt_test.go
+./secure_test.go

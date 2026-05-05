@@ -5,5 +5,7 @@ type Config struct {
 	TLSCertPath      string
 	LocalDBPath      string
 	LocalSaltPath    string
+	ProfileKey       string
+	ProfileLabel     string
 	MasterPassphrase string
 }

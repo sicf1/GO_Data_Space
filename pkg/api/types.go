@@ -38,6 +38,7 @@ type RecordInput struct {
 	Classification  string
 	Age             int
 	Sex             string
+	PatientID       string
 	PatientUsername string
 	PatientAlias    string
 	Observation     string
@@ -49,6 +50,7 @@ type LocalRecord struct {
 	Classification  string   `xml:"classification" json:"classification"`
 	AgeRange        string   `xml:"ageRange" json:"ageRange"`
 	Sex             string   `xml:"sex" json:"sex"`
+	PatientID       string   `xml:"patientId" json:"patientId"`
 	PatientUsername string   `xml:"patientUsername" json:"patientUsername"`
 	PatientAlias    string   `xml:"patientAlias" json:"patientAlias"`
 	Observation     string   `xml:"observation" json:"observation"`
@@ -57,13 +59,13 @@ type LocalRecord struct {
 }
 
 type AnonymizedRecord struct {
-	ID              string `json:"id"`
-	Classification  string `json:"classification"`
-	AgeRange        string `json:"ageRange"`
-	Sex             string `json:"sex"`
-	PatientUsername string `json:"patientUsername"`
-	CreatedAt       string `json:"createdAt"`
-	UploadedBy      string `json:"uploadedBy"`
+	ID             string `json:"id"`
+	Classification string `json:"classification"`
+	AgeRange       string `json:"ageRange"`
+	Sex            string `json:"sex"`
+	PatientID      string `json:"patientId"`
+	CreatedAt      string `json:"createdAt"`
+	UploadedBy     string `json:"uploadedBy"`
 }
 
 type StatsQuery struct {
@@ -97,13 +99,13 @@ func NormalizeClassification(raw string) (string, error) {
 			return candidate, nil
 		}
 	}
-	return "", fmt.Errorf("clasificación no válida")
+	return "", fmt.Errorf("clasificacion no valida")
 }
 
 func NormalizeAgeRange(age int) (string, error) {
 	switch {
 	case age < 0:
-		return "", fmt.Errorf("edad no válida")
+		return "", fmt.Errorf("edad no valida")
 	case age <= 17:
 		return "0-17", nil
 	case age <= 35:
@@ -124,12 +126,15 @@ func NormalizeSex(raw string) (string, error) {
 			return candidate, nil
 		}
 	}
-	return "", fmt.Errorf("sexo no válido")
+	return "", fmt.Errorf("sexo no valido")
 }
 
 func NewLocalRecord(input RecordInput, uploadedBy string, now time.Time) (LocalRecord, error) {
 	if strings.TrimSpace(input.PatientUsername) == "" {
-		return LocalRecord{}, fmt.Errorf("usuario de paciente no válido")
+		return LocalRecord{}, fmt.Errorf("usuario de paciente no valido")
+	}
+	if strings.TrimSpace(input.PatientID) == "" {
+		return LocalRecord{}, fmt.Errorf("identificador anonimizado de paciente no valido")
 	}
 	classification, err := NormalizeClassification(input.Classification)
 	if err != nil {
@@ -153,6 +158,7 @@ func NewLocalRecord(input RecordInput, uploadedBy string, now time.Time) (LocalR
 		Classification:  classification,
 		AgeRange:        ageRange,
 		Sex:             sex,
+		PatientID:       strings.TrimSpace(input.PatientID),
 		PatientUsername: strings.TrimSpace(input.PatientUsername),
 		PatientAlias:    strings.TrimSpace(input.PatientAlias),
 		Observation:     strings.TrimSpace(input.Observation),
@@ -163,18 +169,18 @@ func NewLocalRecord(input RecordInput, uploadedBy string, now time.Time) (LocalR
 
 func (r LocalRecord) ToAnonymized() AnonymizedRecord {
 	return AnonymizedRecord{
-		ID:              r.ID,
-		Classification:  r.Classification,
-		AgeRange:        r.AgeRange,
-		Sex:             r.Sex,
-		PatientUsername: r.PatientUsername,
-		CreatedAt:       r.CreatedAt,
-		UploadedBy:      r.UploadedBy,
+		ID:             r.ID,
+		Classification: r.Classification,
+		AgeRange:       r.AgeRange,
+		Sex:            r.Sex,
+		PatientID:      r.PatientID,
+		CreatedAt:      r.CreatedAt,
+		UploadedBy:     r.UploadedBy,
 	}
 }
 
 func (r AnonymizedRecord) Validate() error {
-	if strings.TrimSpace(r.ID) == "" || strings.TrimSpace(r.UploadedBy) == "" || strings.TrimSpace(r.PatientUsername) == "" {
+	if strings.TrimSpace(r.ID) == "" || strings.TrimSpace(r.UploadedBy) == "" || strings.TrimSpace(r.PatientID) == "" {
 		return fmt.Errorf("faltan identificadores")
 	}
 	if _, err := NormalizeClassification(r.Classification); err != nil {
@@ -187,6 +193,6 @@ func (r AnonymizedRecord) Validate() error {
 	case "0-17", "18-35", "36-50", "51-65", "66+":
 		return nil
 	default:
-		return fmt.Errorf("rango de edad no válido")
+		return fmt.Errorf("rango de edad no valido")
 	}
 }
