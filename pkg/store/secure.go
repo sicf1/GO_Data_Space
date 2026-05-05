@@ -72,7 +72,7 @@ func (s *SecureStore) VerifyOrInit() error {
 		}
 		return nil
 	}
-	if err != nil && !errors.Is(err, ErrNamespaceNotFound) && !errors.Is(err, ErrKeyNotFound) {
+	if !errors.Is(err, ErrNamespaceNotFound) && !errors.Is(err, ErrKeyNotFound) {
 		return err
 	}
 	return s.Put(secureSentinelNS, []byte(secureSentinelKey), []byte(secureSentinelValue))
