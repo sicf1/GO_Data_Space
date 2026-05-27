@@ -39,6 +39,7 @@ const (
 	sessionsNamespace   = "sessions"
 	recordsNamespace    = "records"
 	queriesNamespace    = "queries"
+	agreementsNamespace = "agreements"
 	patientIDsNamespace = "patient_ids"
 )
 
@@ -53,17 +54,19 @@ type userRecord struct {
 	PasswordSalt   string       `json:"passwordSalt"`
 	PasswordHash   string       `json:"passwordHash"`
 	Role           api.UserRole `json:"role"`
+	OrganizationID string       `json:"organizationId"`
 	PatientID      string       `json:"patientId,omitempty"`
 	DataUseAllowed bool         `json:"dataUseAllowed"`
 	CreatedAt      string       `json:"createdAt"`
 }
 
 type sessionRecord struct {
-	Username  string       `json:"username"`
-	Role      api.UserRole `json:"role"`
-	IssuedAt  string       `json:"issuedAt"`
-	LastSeen  string       `json:"lastSeen"`
-	ExpiresAt string       `json:"expiresAt"`
+	Username       string       `json:"username"`
+	Role           api.UserRole `json:"role"`
+	OrganizationID string       `json:"organizationId"`
+	IssuedAt       string       `json:"issuedAt"`
+	LastSeen       string       `json:"lastSeen"`
+	ExpiresAt      string       `json:"expiresAt"`
 }
 
 type legacyStoredRecord struct {
@@ -73,6 +76,7 @@ type legacyStoredRecord struct {
 	Sex             string `json:"sex"`
 	PatientID       string `json:"patientId"`
 	PatientUsername string `json:"patientUsername"`
+	SourceHospital  string `json:"sourceHospital"`
 	CreatedAt       string `json:"createdAt"`
 	UploadedBy      string `json:"uploadedBy"`
 }
@@ -120,8 +124,13 @@ func Run(cfg Config) error {
 	return httpSrv.ListenAndServeTLS(cfg.TLSCertPath, cfg.TLSKeyPath)
 }
 
-func NeedsInitialAdmin(cfg Config) (bool, error) {
+func NeedsInitialAdmin(cfg Config, organizationID string) (bool, error) {
 	cfg = cfg.withDefaults()
+
+	orgID, err := normalizeNonPlatformOrganization(organizationID)
+	if err != nil {
+		return false, err
+	}
 
 	db, err := openSecureStore(cfg)
 	if err != nil {
@@ -129,11 +138,16 @@ func NeedsInitialAdmin(cfg Config) (bool, error) {
 	}
 	defer db.Close()
 
-	return !hasRole(db, api.RoleAdmin), nil
+	return !hasAdminInOrganization(db, orgID), nil
 }
 
-func BootstrapInitialAdmin(cfg Config, username, password string) error {
+func BootstrapInitialAdmin(cfg Config, organizationID, username, password string) error {
 	cfg = cfg.withDefaults()
+
+	orgID, err := normalizeNonPlatformOrganization(organizationID)
+	if err != nil {
+		return err
+	}
 
 	db, err := openSecureStore(cfg)
 	if err != nil {
@@ -145,10 +159,10 @@ func BootstrapInitialAdmin(cfg Config, username, password string) error {
 	if err != nil {
 		return err
 	}
-	if hasRole(db, api.RoleAdmin) {
+	if hasAdminInOrganization(db, orgID) {
 		return nil
 	}
-	res := srv.registerBootstrapAdmin(username, password)
+	res := srv.registerBootstrapAdmin(orgID, username, password)
 	if !res.Success {
 		return errors.New(res.Message)
 	}
@@ -161,13 +175,28 @@ func newServer(db store.Store, timeout time.Duration) (*server, error) {
 		log:                log.New(os.Stdout, "[srv] ", log.LstdFlags),
 		sessionIdleTimeout: timeout,
 	}
-	if err := srv.ensurePatientIdentifiers(); err != nil {
+
+	usersByUsername, err := srv.ensureUsersConsistency()
+	if err != nil {
+		return nil, err
+	}
+	if err := srv.migrateLegacyRecords(usersByUsername); err != nil {
+		return nil, err
+	}
+	if err := srv.migrateLegacyQueries(); err != nil {
 		return nil, err
 	}
 	return srv, nil
 }
 
 func openSecureStore(cfg Config) (store.Store, error) {
+	if err := os.MkdirAll(filepath.Dir(cfg.DBPath), 0755); err != nil {
+		return nil, fmt.Errorf("error creando la carpeta de datos: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(cfg.SaltPath), 0755); err != nil {
+		return nil, fmt.Errorf("error creando la carpeta de la sal maestra: %w", err)
+	}
+
 	base, err := store.NewStore("bbolt", cfg.DBPath)
 	if err != nil {
 		return nil, fmt.Errorf("error abriendo base de datos: %w", err)
@@ -217,7 +246,7 @@ func (s *server) apiHandler(w http.ResponseWriter, r *http.Request) {
 	var res api.Response
 	switch req.Action {
 	case api.ActionRegister:
-		res = s.registerBootstrapAdmin(req.Username, req.Password)
+		res = s.registerBootstrapAdmin(req.OrganizationID, req.Username, req.Password)
 	case api.ActionCreateUser:
 		res = s.createUser(req)
 	case api.ActionValidatePatient:
@@ -226,6 +255,12 @@ func (s *server) apiHandler(w http.ResponseWriter, r *http.Request) {
 		res = s.loginUser(req)
 	case api.ActionUploadRecord:
 		res = s.uploadRecord(req)
+	case api.ActionCreateAgreementRequest:
+		res = s.createAgreementRequest(req)
+	case api.ActionListAgreements:
+		res = s.listAgreements(req)
+	case api.ActionReviewAgreement:
+		res = s.reviewAgreement(req)
 	case api.ActionCreateQueryRequest:
 		res = s.createQueryRequest(req)
 	case api.ActionListQueryRequests:
@@ -244,11 +279,15 @@ func (s *server) apiHandler(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(res)
 }
 
-func (s *server) registerBootstrapAdmin(username, password string) api.Response {
-	if hasRole(s.db, api.RoleAdmin) {
-		return api.Response{Success: false, Message: "El administrador inicial ya existe"}
+func (s *server) registerBootstrapAdmin(organizationID, username, password string) api.Response {
+	orgID, err := normalizeNonPlatformOrganization(organizationID)
+	if err != nil {
+		return api.Response{Success: false, Message: "Organizacion no valida"}
 	}
-	return s.createUserRecord(username, password, api.RoleAdmin)
+	if hasAdminInOrganization(s.db, orgID) {
+		return api.Response{Success: false, Message: "La organizacion ya tiene administrador"}
+	}
+	return s.createUserRecord(username, password, api.RoleAdmin, orgID)
 }
 
 func (s *server) createUser(req api.Request) api.Response {
@@ -259,10 +298,21 @@ func (s *server) createUser(req api.Request) api.Response {
 	if req.Role == api.RoleAdmin {
 		return api.Response{Success: false, Message: "El alta de administradores no esta permitida desde el menu"}
 	}
-	return s.createUserRecord(req.Username, req.Password, req.Role)
+
+	orgID, err := normalizeNonPlatformOrganization(req.OrganizationID)
+	if err != nil {
+		return api.Response{Success: false, Message: "Organizacion no valida"}
+	}
+	if orgID != session.OrganizationID {
+		return api.Response{Success: false, Message: "Solo puedes crear usuarios de tu propia organizacion"}
+	}
+	if !adminCanCreateRole(session.OrganizationID, req.Role, orgID) {
+		return api.Response{Success: false, Message: "Ese rol no se puede crear en la organizacion indicada"}
+	}
+	return s.createUserRecord(req.Username, req.Password, req.Role, orgID)
 }
 
-func (s *server) createUserRecord(username, password string, role api.UserRole) api.Response {
+func (s *server) createUserRecord(username, password string, role api.UserRole, organizationID string) api.Response {
 	username = strings.TrimSpace(username)
 	if username == "" || password == "" {
 		return api.Response{Success: false, Message: "Faltan credenciales"}
@@ -271,6 +321,14 @@ func (s *server) createUserRecord(username, password string, role api.UserRole) 
 	case api.RoleAdmin, api.RoleDoctor, api.RoleResearcher, api.RolePatient:
 	default:
 		return api.Response{Success: false, Message: "Rol no valido"}
+	}
+	var err error
+	organizationID, err = normalizeNonPlatformOrganization(organizationID)
+	if err != nil {
+		return api.Response{Success: false, Message: "Organizacion no valida"}
+	}
+	if role != api.RoleAdmin && !roleAllowedInOrganization(role, organizationID) {
+		return api.Response{Success: false, Message: "Ese rol no se puede crear en la organizacion indicada"}
 	}
 
 	exists, err := s.userExists(username)
@@ -292,6 +350,7 @@ func (s *server) createUserRecord(username, password string, role api.UserRole) 
 		PasswordSalt:   base64.StdEncoding.EncodeToString(salt),
 		PasswordHash:   base64.StdEncoding.EncodeToString(hash),
 		Role:           role,
+		OrganizationID: organizationID,
 		DataUseAllowed: true,
 		CreatedAt:      now.Format(time.RFC3339),
 	}
@@ -312,7 +371,12 @@ func (s *server) createUserRecord(username, password string, role api.UserRole) 
 		}
 	}
 
-	return api.Response{Success: true, Message: "Usuario creado correctamente", Role: role}
+	return api.Response{
+		Success:        true,
+		Message:        "Usuario creado correctamente",
+		Role:           role,
+		OrganizationID: organizationID,
+	}
 }
 
 func (s *server) validatePatient(req api.Request) api.Response {
@@ -336,7 +400,23 @@ func (s *server) validatePatient(req api.Request) api.Response {
 	if patient.PatientID == "" {
 		return api.Response{Success: false, Message: "El paciente no tiene identificador anonimizado asignado"}
 	}
-	return api.Response{Success: true, Message: "Paciente valido", PatientID: patient.PatientID}
+
+	expectedHospital := session.OrganizationID
+	if session.Role == api.RoleAdmin {
+		if !api.IsHospitalOrganization(session.OrganizationID) {
+			return api.Response{Success: false, Message: "El administrador no pertenece a un hospital valido"}
+		}
+	}
+	if patient.OrganizationID != expectedHospital {
+		return api.Response{Success: false, Message: "El paciente no pertenece al hospital actual"}
+	}
+
+	return api.Response{
+		Success:        true,
+		Message:        "Paciente valido",
+		PatientID:      patient.PatientID,
+		OrganizationID: patient.OrganizationID,
+	}
 }
 
 func (s *server) loginUser(req api.Request) api.Response {
@@ -351,27 +431,34 @@ func (s *server) loginUser(req api.Request) api.Response {
 		return api.Response{Success: false, Message: "Credenciales invalidas"}
 	}
 
+	requestedOrg := strings.TrimSpace(req.OrganizationID)
+	if requestedOrg != "" && user.OrganizationID != requestedOrg {
+		return api.Response{Success: false, Message: "Ese usuario no pertenece a la entidad seleccionada"}
+	}
+
 	token, err := generateSessionToken()
 	if err != nil {
 		return api.Response{Success: false, Message: "Error interno de sesion"}
 	}
 	now := time.Now().UTC()
 	session := sessionRecord{
-		Username:  username,
-		Role:      user.Role,
-		IssuedAt:  now.Format(time.RFC3339),
-		LastSeen:  now.Format(time.RFC3339),
-		ExpiresAt: now.Add(s.sessionIdleTimeout).Format(time.RFC3339),
+		Username:       username,
+		Role:           user.Role,
+		OrganizationID: user.OrganizationID,
+		IssuedAt:       now.Format(time.RFC3339),
+		LastSeen:       now.Format(time.RFC3339),
+		ExpiresAt:      now.Add(s.sessionIdleTimeout).Format(time.RFC3339),
 	}
 	if err := putJSON(s.db, sessionsNamespace, []byte(sessionKey(token)), session); err != nil {
 		return api.Response{Success: false, Message: "Error al crear sesion"}
 	}
 
 	res := api.Response{
-		Success: true,
-		Message: "Login exitoso",
-		Token:   token,
-		Role:    user.Role,
+		Success:        true,
+		Message:        "Login exitoso",
+		Token:          token,
+		Role:           user.Role,
+		OrganizationID: user.OrganizationID,
 	}
 	if user.Role == api.RolePatient {
 		consent := user.DataUseAllowed
@@ -388,6 +475,9 @@ func (s *server) uploadRecord(req api.Request) api.Response {
 	if session.Role != api.RoleDoctor {
 		return api.Response{Success: false, Message: "Solo un medico puede introducir datos de paciente"}
 	}
+	if !api.IsHospitalOrganization(session.OrganizationID) {
+		return api.Response{Success: false, Message: "El medico no pertenece a un hospital valido"}
+	}
 	if req.Record == nil {
 		return api.Response{Success: false, Message: "Falta el registro anonimizado"}
 	}
@@ -397,10 +487,16 @@ func (s *server) uploadRecord(req api.Request) api.Response {
 	if req.Record.UploadedBy != session.Username {
 		return api.Response{Success: false, Message: "El registro no pertenece al medico autenticado"}
 	}
+	if req.Record.SourceHospital != session.OrganizationID {
+		return api.Response{Success: false, Message: "El registro no corresponde al hospital del medico autenticado"}
+	}
 
 	patient, err := s.loadPatientByID(req.Record.PatientID)
 	if err != nil || patient.Role != api.RolePatient {
 		return api.Response{Success: false, Message: "El paciente indicado no existe"}
+	}
+	if patient.OrganizationID != session.OrganizationID {
+		return api.Response{Success: false, Message: "El paciente no pertenece al hospital del medico"}
 	}
 
 	if err := putJSON(s.db, recordsNamespace, []byte(req.Record.ID), req.Record); err != nil {
@@ -413,13 +509,150 @@ func (s *server) uploadRecord(req api.Request) api.Response {
 	}
 }
 
+func (s *server) createAgreementRequest(req api.Request) api.Response {
+	session, ok := s.authenticate(req.Token)
+	if !ok {
+		return api.Response{Success: false, Message: "Token invalido o sesion expirada"}
+	}
+	if session.Role != api.RoleResearcher || !api.IsResearchCenterOrganization(session.OrganizationID) {
+		return api.Response{Success: false, Message: "Solo un investigador de un centro de investigacion puede pedir acuerdos"}
+	}
+
+	hospitalID, err := resolveHospitalOrganization(req.HospitalID)
+	if err != nil {
+		return api.Response{Success: false, Message: "Hospital no valido"}
+	}
+	if existing, found, err := s.findLatestAgreement(session.OrganizationID, hospitalID); err != nil {
+		return api.Response{Success: false, Message: "Error al comprobar acuerdos existentes"}
+	} else if found && (existing.Status == api.AgreementPending || existing.Status == api.AgreementApproved) {
+		return api.Response{Success: false, Message: "Ya existe un acuerdo pendiente o aprobado con ese hospital"}
+	}
+
+	agreement := api.Agreement{
+		ID:               generateIdentifier("agr"),
+		HospitalID:       hospitalID,
+		ResearchCenterID: session.OrganizationID,
+		RequestedBy:      session.Username,
+		Status:           api.AgreementPending,
+		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := putJSON(s.db, agreementsNamespace, []byte(agreement.ID), agreement); err != nil {
+		return api.Response{Success: false, Message: "Error al guardar la solicitud de acuerdo"}
+	}
+	return api.Response{Success: true, Message: "Solicitud de acuerdo registrada"}
+}
+
+func (s *server) listAgreements(req api.Request) api.Response {
+	session, ok := s.authenticate(req.Token)
+	if !ok {
+		return api.Response{Success: false, Message: "Token invalido o sesion expirada"}
+	}
+	if session.Role != api.RoleAdmin && session.Role != api.RoleResearcher {
+		return api.Response{Success: false, Message: "No autorizado para consultar acuerdos"}
+	}
+
+	keys, err := s.db.ListKeys(agreementsNamespace)
+	if err != nil && !errors.Is(err, store.ErrNamespaceNotFound) {
+		return api.Response{Success: false, Message: "Error al leer acuerdos"}
+	}
+
+	var agreements []api.Agreement
+	for _, key := range keys {
+		var agreement api.Agreement
+		if err := getJSON(s.db, agreementsNamespace, key, &agreement); err != nil {
+			return api.Response{Success: false, Message: "Error al procesar acuerdos"}
+		}
+		if session.Role == api.RoleResearcher && agreement.ResearchCenterID != session.OrganizationID {
+			continue
+		}
+		if session.Role == api.RoleAdmin {
+			switch {
+			case api.IsHospitalOrganization(session.OrganizationID):
+				if agreement.HospitalID != session.OrganizationID {
+					continue
+				}
+			case api.IsResearchCenterOrganization(session.OrganizationID):
+				if agreement.ResearchCenterID != session.OrganizationID {
+					continue
+				}
+			default:
+				return api.Response{Success: false, Message: "El administrador no pertenece a una organizacion valida"}
+			}
+		}
+		if req.AgreementStatusFilter != "" && agreement.Status != req.AgreementStatusFilter {
+			continue
+		}
+		agreements = append(agreements, agreement)
+	}
+
+	sort.Slice(agreements, func(i, j int) bool {
+		return agreements[i].CreatedAt > agreements[j].CreatedAt
+	})
+	return api.Response{
+		Success:    true,
+		Message:    "Acuerdos recuperados correctamente",
+		Agreements: agreements,
+	}
+}
+
+func (s *server) reviewAgreement(req api.Request) api.Response {
+	session, ok := s.authenticate(req.Token)
+	if !ok {
+		return api.Response{Success: false, Message: "Token invalido o sesion expirada"}
+	}
+	if session.Role != api.RoleAdmin {
+		return api.Response{Success: false, Message: "Solo un administrador puede revisar acuerdos"}
+	}
+	if !api.IsHospitalOrganization(session.OrganizationID) {
+		return api.Response{Success: false, Message: "Solo un administrador hospitalario puede revisar acuerdos"}
+	}
+	if strings.TrimSpace(req.AgreementID) == "" {
+		return api.Response{Success: false, Message: "Falta el identificador del acuerdo"}
+	}
+	if req.AgreementReviewStatus != api.AgreementApproved && req.AgreementReviewStatus != api.AgreementDenied {
+		return api.Response{Success: false, Message: "Estado de revision de acuerdo no valido"}
+	}
+
+	var agreement api.Agreement
+	if err := getJSON(s.db, agreementsNamespace, []byte(req.AgreementID), &agreement); err != nil {
+		return api.Response{Success: false, Message: "El acuerdo no existe"}
+	}
+	if agreement.HospitalID != session.OrganizationID {
+		return api.Response{Success: false, Message: "Ese acuerdo no pertenece al hospital actual"}
+	}
+	if agreement.Status != api.AgreementPending {
+		return api.Response{Success: false, Message: "El acuerdo ya fue revisado"}
+	}
+
+	agreement.Status = req.AgreementReviewStatus
+	agreement.ReviewedBy = session.Username
+	agreement.ReviewedAt = time.Now().UTC().Format(time.RFC3339)
+	agreement.ReviewComment = strings.TrimSpace(req.AgreementComment)
+	if err := putJSON(s.db, agreementsNamespace, []byte(agreement.ID), agreement); err != nil {
+		return api.Response{Success: false, Message: "Error al actualizar el acuerdo"}
+	}
+	return api.Response{Success: true, Message: "Acuerdo revisado correctamente"}
+}
+
 func (s *server) createQueryRequest(req api.Request) api.Response {
 	session, ok := s.authenticate(req.Token)
 	if !ok {
 		return api.Response{Success: false, Message: "Token invalido o sesion expirada"}
 	}
-	if session.Role != api.RoleResearcher {
-		return api.Response{Success: false, Message: "Solo un investigador puede pedir consultas"}
+	if session.Role != api.RoleResearcher || !api.IsResearchCenterOrganization(session.OrganizationID) {
+		return api.Response{Success: false, Message: "Solo un investigador de un centro de investigacion puede pedir consultas"}
+	}
+
+	hospitalID, err := resolveHospitalOrganization(req.HospitalID)
+	if err != nil {
+		return api.Response{Success: false, Message: "Hospital no valido"}
+	}
+	agreement, found, err := s.findApprovedAgreement(session.OrganizationID, hospitalID)
+	if err != nil {
+		return api.Response{Success: false, Message: "Error al comprobar el acuerdo"}
+	}
+	if !found {
+		return api.Response{Success: false, Message: "No existe un acuerdo aprobado con ese hospital"}
 	}
 
 	query := api.StatsQuery{}
@@ -439,6 +672,8 @@ func (s *server) createQueryRequest(req api.Request) api.Response {
 
 	request := api.StatsRequest{
 		ID:             generateIdentifier("qry"),
+		HospitalID:     hospitalID,
+		AgreementID:    agreement.ID,
 		Classification: query.Classification,
 		AgeRange:       query.AgeRange,
 		RequestedBy:    session.Username,
@@ -465,6 +700,10 @@ func (s *server) listQueryRequests(req api.Request) api.Response {
 		return api.Response{Success: false, Message: "Error al leer peticiones"}
 	}
 
+	if session.Role == api.RoleAdmin && !api.IsHospitalOrganization(session.OrganizationID) {
+		return api.Response{Success: false, Message: "Solo un administrador hospitalario puede consultar peticiones"}
+	}
+
 	var requests []api.StatsRequest
 	for _, key := range keys {
 		var query api.StatsRequest
@@ -472,6 +711,9 @@ func (s *server) listQueryRequests(req api.Request) api.Response {
 			return api.Response{Success: false, Message: "Error al procesar peticiones"}
 		}
 		if session.Role == api.RoleResearcher && query.RequestedBy != session.Username {
+			continue
+		}
+		if session.Role == api.RoleAdmin && query.HospitalID != session.OrganizationID {
 			continue
 		}
 		if req.StatusFilter != "" && query.Status != req.StatusFilter {
@@ -505,6 +747,9 @@ func (s *server) reviewQueryRequest(req api.Request) api.Response {
 	if session.Role != api.RoleAdmin {
 		return api.Response{Success: false, Message: "Solo un administrador puede revisar peticiones"}
 	}
+	if !api.IsHospitalOrganization(session.OrganizationID) {
+		return api.Response{Success: false, Message: "Solo un administrador hospitalario puede revisar peticiones"}
+	}
 	if strings.TrimSpace(req.QueryID) == "" {
 		return api.Response{Success: false, Message: "Falta el identificador de la peticion"}
 	}
@@ -515,6 +760,9 @@ func (s *server) reviewQueryRequest(req api.Request) api.Response {
 	var query api.StatsRequest
 	if err := getJSON(s.db, queriesNamespace, []byte(req.QueryID), &query); err != nil {
 		return api.Response{Success: false, Message: "La peticion no existe"}
+	}
+	if query.HospitalID != session.OrganizationID {
+		return api.Response{Success: false, Message: "Esa peticion no pertenece al hospital actual"}
 	}
 	if query.Status != api.QueryPending {
 		return api.Response{Success: false, Message: "La peticion ya fue revisada"}
@@ -581,8 +829,14 @@ func (s *server) computeStats(query api.StatsRequest) ([]api.StatsRow, error) {
 		if err := getJSON(s.db, recordsNamespace, key, &record); err != nil {
 			return nil, err
 		}
+		if record.SourceHospital != query.HospitalID {
+			continue
+		}
 		patient, err := s.loadPatientByID(record.PatientID)
 		if err != nil || patient.Role != api.RolePatient || !patient.DataUseAllowed {
+			continue
+		}
+		if patient.OrganizationID != query.HospitalID {
 			continue
 		}
 		if query.Classification != "" && record.Classification != query.Classification {
@@ -703,13 +957,13 @@ func (s *server) findUsernameByPatientID(patientID string) (string, error) {
 	return "", store.ErrKeyNotFound
 }
 
-func (s *server) ensurePatientIdentifiers() error {
+func (s *server) ensureUsersConsistency() (map[string]userRecord, error) {
 	keys, err := s.db.ListKeys(usersNamespace)
 	if err != nil {
 		if errors.Is(err, store.ErrNamespaceNotFound) {
-			return nil
+			return map[string]userRecord{}, nil
 		}
-		return err
+		return nil, err
 	}
 
 	usersByUsername := make(map[string]userRecord, len(keys))
@@ -719,22 +973,30 @@ func (s *server) ensurePatientIdentifiers() error {
 	for _, key := range keys {
 		var user userRecord
 		if err := getJSON(s.db, usersNamespace, key, &user); err != nil {
-			return err
+			return nil, err
+		}
+
+		changed := false
+		if strings.TrimSpace(user.OrganizationID) == "" {
+			user.OrganizationID = defaultLegacyOrganizationForRole(user.Role)
+			changed = true
+		}
+		if user.Role == api.RolePatient {
+			if idx, ok := parsePatientID(user.PatientID); ok && idx > maxPatientIndex {
+				maxPatientIndex = idx
+			}
+			if strings.TrimSpace(user.PatientID) == "" {
+				patientsWithoutID = append(patientsWithoutID, patientUser{key: key, user: user})
+			} else if err := s.db.Put(patientIDsNamespace, []byte(user.PatientID), []byte(user.Username)); err != nil {
+				return nil, err
+			}
+		}
+		if changed {
+			if err := putJSON(s.db, usersNamespace, key, user); err != nil {
+				return nil, err
+			}
 		}
 		usersByUsername[user.Username] = user
-		if user.Role != api.RolePatient {
-			continue
-		}
-		if idx, ok := parsePatientID(user.PatientID); ok && idx > maxPatientIndex {
-			maxPatientIndex = idx
-		}
-		if strings.TrimSpace(user.PatientID) == "" {
-			patientsWithoutID = append(patientsWithoutID, patientUser{key: key, user: user})
-			continue
-		}
-		if err := s.db.Put(patientIDsNamespace, []byte(user.PatientID), []byte(user.Username)); err != nil {
-			return err
-		}
 	}
 
 	sort.Slice(patientsWithoutID, func(i, j int) bool {
@@ -748,15 +1010,15 @@ func (s *server) ensurePatientIdentifiers() error {
 		maxPatientIndex++
 		patient.user.PatientID = formatPatientID(maxPatientIndex)
 		if err := putJSON(s.db, usersNamespace, patient.key, patient.user); err != nil {
-			return err
+			return nil, err
 		}
 		if err := s.db.Put(patientIDsNamespace, []byte(patient.user.PatientID), []byte(patient.user.Username)); err != nil {
-			return err
+			return nil, err
 		}
 		usersByUsername[patient.user.Username] = patient.user
 	}
 
-	return s.migrateLegacyRecords(usersByUsername)
+	return usersByUsername, nil
 }
 
 func (s *server) migrateLegacyRecords(usersByUsername map[string]userRecord) error {
@@ -779,7 +1041,7 @@ func (s *server) migrateLegacyRecords(usersByUsername map[string]userRecord) err
 			return err
 		}
 
-		if strings.TrimSpace(legacy.PatientID) != "" && strings.TrimSpace(legacy.PatientUsername) == "" {
+		if strings.TrimSpace(legacy.PatientID) != "" && strings.TrimSpace(legacy.PatientUsername) == "" && strings.TrimSpace(legacy.SourceHospital) != "" {
 			continue
 		}
 
@@ -791,12 +1053,17 @@ func (s *server) migrateLegacyRecords(usersByUsername map[string]userRecord) err
 			legacy.PatientID = patient.PatientID
 		}
 
+		if strings.TrimSpace(legacy.SourceHospital) == "" {
+			legacy.SourceHospital = inferLegacyHospital(usersByUsername, legacy.UploadedBy, legacy.PatientUsername)
+		}
+
 		record := api.AnonymizedRecord{
 			ID:             legacy.ID,
 			Classification: legacy.Classification,
 			AgeRange:       legacy.AgeRange,
 			Sex:            legacy.Sex,
 			PatientID:      legacy.PatientID,
+			SourceHospital: legacy.SourceHospital,
 			CreatedAt:      legacy.CreatedAt,
 			UploadedBy:     legacy.UploadedBy,
 		}
@@ -808,6 +1075,91 @@ func (s *server) migrateLegacyRecords(usersByUsername map[string]userRecord) err
 		}
 	}
 	return nil
+}
+
+func (s *server) migrateLegacyQueries() error {
+	keys, err := s.db.ListKeys(queriesNamespace)
+	if err != nil {
+		if errors.Is(err, store.ErrNamespaceNotFound) {
+			return nil
+		}
+		return err
+	}
+
+	for _, key := range keys {
+		var query api.StatsRequest
+		if err := getJSON(s.db, queriesNamespace, key, &query); err != nil {
+			return err
+		}
+		changed := false
+		if strings.TrimSpace(query.HospitalID) == "" {
+			query.HospitalID = api.OrgHospital1
+			changed = true
+		}
+		if changed {
+			if err := putJSON(s.db, queriesNamespace, key, query); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *server) findApprovedAgreement(researchCenterID, hospitalID string) (api.Agreement, bool, error) {
+	keys, err := s.db.ListKeys(agreementsNamespace)
+	if err != nil {
+		if errors.Is(err, store.ErrNamespaceNotFound) {
+			return api.Agreement{}, false, nil
+		}
+		return api.Agreement{}, false, err
+	}
+
+	var latest api.Agreement
+	found := false
+	for _, key := range keys {
+		var agreement api.Agreement
+		if err := getJSON(s.db, agreementsNamespace, key, &agreement); err != nil {
+			return api.Agreement{}, false, err
+		}
+		if agreement.ResearchCenterID != researchCenterID || agreement.HospitalID != hospitalID {
+			continue
+		}
+		if agreement.Status != api.AgreementApproved {
+			continue
+		}
+		if !found || agreement.CreatedAt > latest.CreatedAt {
+			latest = agreement
+			found = true
+		}
+	}
+	return latest, found, nil
+}
+
+func (s *server) findLatestAgreement(researchCenterID, hospitalID string) (api.Agreement, bool, error) {
+	keys, err := s.db.ListKeys(agreementsNamespace)
+	if err != nil {
+		if errors.Is(err, store.ErrNamespaceNotFound) {
+			return api.Agreement{}, false, nil
+		}
+		return api.Agreement{}, false, err
+	}
+
+	var latest api.Agreement
+	found := false
+	for _, key := range keys {
+		var agreement api.Agreement
+		if err := getJSON(s.db, agreementsNamespace, key, &agreement); err != nil {
+			return api.Agreement{}, false, err
+		}
+		if agreement.ResearchCenterID != researchCenterID || agreement.HospitalID != hospitalID {
+			continue
+		}
+		if !found || agreement.CreatedAt > latest.CreatedAt {
+			latest = agreement
+			found = true
+		}
+	}
+	return latest, found, nil
 }
 
 func (s *server) allocateNextPatientID() (string, error) {
@@ -835,6 +1187,70 @@ func (s *server) allocateNextPatientID() (string, error) {
 	return formatPatientID(maxPatientIndex + 1), nil
 }
 
+func roleAllowedInOrganization(role api.UserRole, organizationID string) bool {
+	switch role {
+	case api.RoleDoctor, api.RolePatient:
+		return api.IsHospitalOrganization(organizationID)
+	case api.RoleResearcher:
+		return api.IsResearchCenterOrganization(organizationID)
+	default:
+		return false
+	}
+}
+
+func adminCanCreateRole(adminOrganizationID string, role api.UserRole, targetOrganizationID string) bool {
+	if adminOrganizationID != targetOrganizationID {
+		return false
+	}
+	switch {
+	case api.IsHospitalOrganization(adminOrganizationID):
+		return role == api.RoleDoctor || role == api.RolePatient
+	case api.IsResearchCenterOrganization(adminOrganizationID):
+		return role == api.RoleResearcher
+	default:
+		return false
+	}
+}
+
+func defaultLegacyOrganizationForRole(role api.UserRole) string {
+	switch role {
+	case api.RoleResearcher:
+		return api.OrgResearchCenter1
+	case api.RoleDoctor, api.RolePatient:
+		return api.OrgHospital1
+	case api.RoleAdmin:
+		return api.OrgPlatform
+	default:
+		return api.OrgPlatform
+	}
+}
+
+func normalizeNonPlatformOrganization(raw string) (string, error) {
+	orgID, err := api.NormalizeOrganizationID(raw)
+	if err != nil || orgID == api.OrgPlatform {
+		return "", fmt.Errorf("organizacion no valida")
+	}
+	return orgID, nil
+}
+
+func resolveHospitalOrganization(raw string) (string, error) {
+	orgID, err := api.NormalizeOrganizationID(raw)
+	if err != nil || !api.IsHospitalOrganization(orgID) {
+		return "", fmt.Errorf("hospital no valido")
+	}
+	return orgID, nil
+}
+
+func inferLegacyHospital(usersByUsername map[string]userRecord, uploadedBy, patientUsername string) string {
+	if uploader, ok := usersByUsername[strings.TrimSpace(uploadedBy)]; ok && api.IsHospitalOrganization(uploader.OrganizationID) {
+		return uploader.OrganizationID
+	}
+	if patient, ok := usersByUsername[strings.TrimSpace(patientUsername)]; ok && api.IsHospitalOrganization(patient.OrganizationID) {
+		return patient.OrganizationID
+	}
+	return api.OrgHospital1
+}
+
 func hasRole(db store.Store, role api.UserRole) bool {
 	keys, err := db.ListKeys(usersNamespace)
 	if err != nil {
@@ -843,6 +1259,20 @@ func hasRole(db store.Store, role api.UserRole) bool {
 	for _, key := range keys {
 		var user userRecord
 		if err := getJSON(db, usersNamespace, key, &user); err == nil && user.Role == role {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAdminInOrganization(db store.Store, organizationID string) bool {
+	keys, err := db.ListKeys(usersNamespace)
+	if err != nil {
+		return false
+	}
+	for _, key := range keys {
+		var user userRecord
+		if err := getJSON(db, usersNamespace, key, &user); err == nil && user.Role == api.RoleAdmin && user.OrganizationID == organizationID {
 			return true
 		}
 	}

@@ -52,19 +52,19 @@ func main() {
 	}
 	clientCfg := client.BuildProfileConfig(selectedProfile, clientMasterPassphrase)
 
-	needsAdmin, err := server.NeedsInitialAdmin(serverCfg)
+	needsAdmin, err := server.NeedsInitialAdmin(serverCfg, selectedProfile.Key)
 	if err != nil {
-		mainLog.Fatalf("No se ha podido verificar el administrador inicial: %v", err)
+		mainLog.Fatalf("No se ha podido verificar el administrador de %s: %v", selectedProfile.Label, err)
 	}
 	if needsAdmin {
-		mainLog.Println("No existe administrador inicial; se va a crear ahora.")
-		adminUser := ui.ReadInput("Usuario administrador inicial")
-		adminPassword, err := ui.ReadPassword("Contrasena del administrador inicial")
+		mainLog.Printf("No existe administrador para %s; se va a crear ahora.\n", selectedProfile.Label)
+		adminUser := ui.ReadInput("Usuario administrador de " + selectedProfile.Label)
+		adminPassword, err := ui.ReadPassword("Contrasena del administrador de " + selectedProfile.Label)
 		if err != nil || adminPassword == "" {
-			mainLog.Fatalf("No se ha podido leer la contrasena del administrador inicial")
+			mainLog.Fatalf("No se ha podido leer la contrasena del administrador de %s", selectedProfile.Label)
 		}
-		if err := server.BootstrapInitialAdmin(serverCfg, adminUser, adminPassword); err != nil {
-			mainLog.Fatalf("No se ha podido crear el administrador inicial: %v", err)
+		if err := server.BootstrapInitialAdmin(serverCfg, selectedProfile.Key, adminUser, adminPassword); err != nil {
+			mainLog.Fatalf("No se ha podido crear el administrador de %s: %v", selectedProfile.Label, err)
 		}
 	}
 

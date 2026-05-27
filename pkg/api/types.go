@@ -16,12 +16,47 @@ const (
 	RolePatient    UserRole = "patient"
 )
 
+const (
+	OrgPlatform             = "platform"
+	OrgHospital1            = "hospital1"
+	OrgHospital2            = "hospital2"
+	OrgHospital3            = "hospital3"
+	OrgResearchCenter1      = "centro_investigacion1"
+	OrgResearchCenter1Label = "centro de investigacion1"
+)
+
+var HospitalOrganizations = []string{
+	OrgHospital1,
+	OrgHospital2,
+	OrgHospital3,
+}
+
+var ResearchCenterOrganizations = []string{
+	OrgResearchCenter1,
+}
+
+var KnownOrganizations = []string{
+	OrgPlatform,
+	OrgHospital1,
+	OrgHospital2,
+	OrgHospital3,
+	OrgResearchCenter1,
+}
+
 type QueryStatus string
 
 const (
 	QueryPending  QueryStatus = "pending"
 	QueryApproved QueryStatus = "approved"
 	QueryDenied   QueryStatus = "denied"
+)
+
+type AgreementStatus string
+
+const (
+	AgreementPending  AgreementStatus = "pending"
+	AgreementApproved AgreementStatus = "approved"
+	AgreementDenied   AgreementStatus = "denied"
 )
 
 var SupportedClassifications = []string{
@@ -42,6 +77,7 @@ type RecordInput struct {
 	PatientUsername string
 	PatientAlias    string
 	Observation     string
+	SourceHospital  string
 }
 
 type LocalRecord struct {
@@ -54,6 +90,7 @@ type LocalRecord struct {
 	PatientUsername string   `xml:"patientUsername" json:"patientUsername"`
 	PatientAlias    string   `xml:"patientAlias" json:"patientAlias"`
 	Observation     string   `xml:"observation" json:"observation"`
+	SourceHospital  string   `xml:"sourceHospital" json:"sourceHospital"`
 	CreatedAt       string   `xml:"createdAt" json:"createdAt"`
 	UploadedBy      string   `xml:"uploadedBy" json:"uploadedBy"`
 }
@@ -64,6 +101,7 @@ type AnonymizedRecord struct {
 	AgeRange       string `json:"ageRange"`
 	Sex            string `json:"sex"`
 	PatientID      string `json:"patientId"`
+	SourceHospital string `json:"sourceHospital"`
 	CreatedAt      string `json:"createdAt"`
 	UploadedBy     string `json:"uploadedBy"`
 }
@@ -79,8 +117,22 @@ type StatsRow struct {
 	Count          int    `json:"count"`
 }
 
+type Agreement struct {
+	ID               string          `json:"id"`
+	HospitalID       string          `json:"hospitalId"`
+	ResearchCenterID string          `json:"researchCenterId"`
+	RequestedBy      string          `json:"requestedBy"`
+	Status           AgreementStatus `json:"status"`
+	CreatedAt        string          `json:"createdAt"`
+	ReviewedBy       string          `json:"reviewedBy,omitempty"`
+	ReviewedAt       string          `json:"reviewedAt,omitempty"`
+	ReviewComment    string          `json:"reviewComment,omitempty"`
+}
+
 type StatsRequest struct {
 	ID             string      `json:"id"`
+	HospitalID     string      `json:"hospitalId"`
+	AgreementID    string      `json:"agreementId,omitempty"`
 	Classification string      `json:"classification,omitempty"`
 	AgeRange       string      `json:"ageRange,omitempty"`
 	RequestedBy    string      `json:"requestedBy"`
@@ -129,12 +181,45 @@ func NormalizeSex(raw string) (string, error) {
 	return "", fmt.Errorf("sexo no valido")
 }
 
+func NormalizeOrganizationID(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	for _, candidate := range KnownOrganizations {
+		if value == candidate {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("organizacion no valida")
+}
+
+func IsHospitalOrganization(orgID string) bool {
+	orgID = strings.TrimSpace(orgID)
+	for _, candidate := range HospitalOrganizations {
+		if orgID == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func IsResearchCenterOrganization(orgID string) bool {
+	orgID = strings.TrimSpace(orgID)
+	for _, candidate := range ResearchCenterOrganizations {
+		if orgID == candidate {
+			return true
+		}
+	}
+	return false
+}
+
 func NewLocalRecord(input RecordInput, uploadedBy string, now time.Time) (LocalRecord, error) {
 	if strings.TrimSpace(input.PatientUsername) == "" {
 		return LocalRecord{}, fmt.Errorf("usuario de paciente no valido")
 	}
 	if strings.TrimSpace(input.PatientID) == "" {
 		return LocalRecord{}, fmt.Errorf("identificador anonimizado de paciente no valido")
+	}
+	if !IsHospitalOrganization(input.SourceHospital) {
+		return LocalRecord{}, fmt.Errorf("hospital de origen no valido")
 	}
 	classification, err := NormalizeClassification(input.Classification)
 	if err != nil {
@@ -162,6 +247,7 @@ func NewLocalRecord(input RecordInput, uploadedBy string, now time.Time) (LocalR
 		PatientUsername: strings.TrimSpace(input.PatientUsername),
 		PatientAlias:    strings.TrimSpace(input.PatientAlias),
 		Observation:     strings.TrimSpace(input.Observation),
+		SourceHospital:  strings.TrimSpace(input.SourceHospital),
 		CreatedAt:       timestamp,
 		UploadedBy:      uploadedBy,
 	}, nil
@@ -174,6 +260,7 @@ func (r LocalRecord) ToAnonymized() AnonymizedRecord {
 		AgeRange:       r.AgeRange,
 		Sex:            r.Sex,
 		PatientID:      r.PatientID,
+		SourceHospital: r.SourceHospital,
 		CreatedAt:      r.CreatedAt,
 		UploadedBy:     r.UploadedBy,
 	}
@@ -182,6 +269,9 @@ func (r LocalRecord) ToAnonymized() AnonymizedRecord {
 func (r AnonymizedRecord) Validate() error {
 	if strings.TrimSpace(r.ID) == "" || strings.TrimSpace(r.UploadedBy) == "" || strings.TrimSpace(r.PatientID) == "" {
 		return fmt.Errorf("faltan identificadores")
+	}
+	if !IsHospitalOrganization(r.SourceHospital) {
+		return fmt.Errorf("hospital de origen no valido")
 	}
 	if _, err := NormalizeClassification(r.Classification); err != nil {
 		return err

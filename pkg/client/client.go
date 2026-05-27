@@ -23,6 +23,7 @@ import (
 type client struct {
 	log            *log.Logger
 	serverURL      string
+	profileKey     string
 	profileLabel   string
 	currentUser    string
 	currentRole    api.UserRole
@@ -47,6 +48,7 @@ func Run(cfg Config) error {
 	c := &client{
 		log:          log.New(os.Stdout, "[cli] ", log.LstdFlags),
 		serverURL:    cfg.ServerURL,
+		profileKey:   cfg.ProfileKey,
 		profileLabel: cfg.ProfileLabel,
 		httpClient: &http.Client{
 			Timeout:   5 * time.Second,
@@ -116,25 +118,46 @@ func (c *client) runLoop() {
 }
 
 func (c *client) runAdminMenu() {
+	if api.IsHospitalOrganization(c.profileKey) {
+		switch ui.PrintMenu(c.menuTitle(fmt.Sprintf("Administrador (%s)", c.currentUser)), []string{
+			"Revisar acuerdos con centros de investigacion",
+			"Autorizar peticion de consulta",
+			"Dar de alta medico",
+			"Dar de alta paciente",
+			"Cerrar sesion",
+			"Salir",
+		}) {
+		case 1:
+			c.reviewPendingAgreement()
+		case 2:
+			c.reviewPendingQuery()
+		case 3:
+			c.createUser(api.RoleDoctor)
+		case 4:
+			c.createUser(api.RolePatient)
+		case 5:
+			c.logoutUser()
+		case 6:
+			c.log.Printf("Saliendo de %s...\n", c.profileLabel)
+			c.exitRequested = true
+		}
+		ui.Pause("Pulsa [Enter] para continuar...")
+		return
+	}
+
 	switch ui.PrintMenu(c.menuTitle(fmt.Sprintf("Administrador (%s)", c.currentUser)), []string{
-		"Autorizar peticion",
-		"Dar de alta medico",
 		"Dar de alta investigador",
-		"Dar de alta paciente",
+		"Ver acuerdos del centro",
 		"Cerrar sesion",
 		"Salir",
 	}) {
 	case 1:
-		c.reviewPendingQuery()
-	case 2:
-		c.createUser(api.RoleDoctor)
-	case 3:
 		c.createUser(api.RoleResearcher)
-	case 4:
-		c.createUser(api.RolePatient)
-	case 5:
+	case 2:
+		c.listAgreements("")
+	case 3:
 		c.logoutUser()
-	case 6:
+	case 4:
 		c.log.Printf("Saliendo de %s...\n", c.profileLabel)
 		c.exitRequested = true
 	}
@@ -166,6 +189,8 @@ func (c *client) runDoctorMenu() {
 
 func (c *client) runResearcherMenu() {
 	switch ui.PrintMenu(c.menuTitle(fmt.Sprintf("Investigador (%s)", c.currentUser)), []string{
+		"Solicitar acuerdo con hospital",
+		"Ver acuerdos",
 		"Hacer peticion de consulta de datos",
 		"Ver consultas aprobadas",
 		"Ver consultas denegadas",
@@ -173,14 +198,18 @@ func (c *client) runResearcherMenu() {
 		"Salir",
 	}) {
 	case 1:
-		c.createQueryRequest()
+		c.createAgreementRequest()
 	case 2:
-		c.listQueries(api.QueryApproved)
+		c.listAgreements("")
 	case 3:
-		c.listQueries(api.QueryDenied)
+		c.createQueryRequest()
 	case 4:
-		c.logoutUser()
+		c.listQueries(api.QueryApproved)
 	case 5:
+		c.listQueries(api.QueryDenied)
+	case 6:
+		c.logoutUser()
+	case 7:
 		c.log.Printf("Saliendo de %s...\n", c.profileLabel)
 		c.exitRequested = true
 	}
@@ -293,6 +322,7 @@ func (c *client) createLocalRecord() {
 		Sex:             ui.ReadInput("Sexo"),
 		PatientAlias:    ui.ReadInput("Alias local del paciente"),
 		Observation:     ui.ReadMultiline("Observaciones medicas"),
+		SourceHospital:  c.profileKey,
 	}
 	record, err := api.NewLocalRecord(input, c.currentUser, time.Now())
 	if err != nil {
@@ -333,8 +363,8 @@ func (c *client) listLocalRecords() {
 		return
 	}
 	for i, record := range records {
-		fmt.Printf("%d. ID=%s | paciente=%s | usuario=%s | clasificacion=%s | rango=%s | sexo=%s\n",
-			i+1, record.ID, record.PatientID, record.PatientUsername, record.Classification, record.AgeRange, record.Sex)
+		fmt.Printf("%d. ID=%s | hospital=%s | paciente=%s | usuario=%s | clasificacion=%s | rango=%s | sexo=%s\n",
+			i+1, record.ID, record.SourceHospital, record.PatientID, record.PatientUsername, record.Classification, record.AgeRange, record.Sex)
 	}
 }
 
@@ -354,8 +384,8 @@ func (c *client) uploadLocalRecord() {
 
 	options := make([]string, 0, len(records))
 	for _, record := range records {
-		options = append(options, fmt.Sprintf("%s | paciente=%s | %s | %s",
-			record.ID, emptyLabel(record.PatientID, "sin-id"), record.Classification, record.AgeRange))
+		options = append(options, fmt.Sprintf("%s | hospital=%s | paciente=%s | %s | %s",
+			record.ID, emptyLabel(record.SourceHospital, "sin-hospital"), emptyLabel(record.PatientID, "sin-id"), record.Classification, record.AgeRange))
 	}
 	choice := ui.PrintMenu("Selecciona un registro", options)
 	selected := records[choice-1]
@@ -366,10 +396,13 @@ func (c *client) uploadLocalRecord() {
 			return
 		}
 		selected.PatientID = patientID
-		if err := storeLocalRecord(c.localStore, selected); err != nil {
-			fmt.Println("No se ha podido actualizar el identificador anonimizado local:", err)
-			return
-		}
+	}
+	if strings.TrimSpace(selected.SourceHospital) == "" {
+		selected.SourceHospital = c.profileKey
+	}
+	if err := storeLocalRecord(c.localStore, selected); err != nil {
+		fmt.Println("No se ha podido actualizar el registro local:", err)
+		return
 	}
 
 	res := c.sendRequest(api.Request{
@@ -381,6 +414,89 @@ func (c *client) uploadLocalRecord() {
 	fmt.Println("Mensaje:", res.Message)
 }
 
+func (c *client) createAgreementRequest() {
+	ui.ClearScreen()
+	fmt.Println("** Nueva solicitud de acuerdo **")
+
+	hospitalID := c.chooseHospital("Selecciona el hospital con el que quieres firmar un acuerdo")
+	res := c.sendRequest(api.Request{
+		Action:     api.ActionCreateAgreementRequest,
+		Token:      c.authToken,
+		HospitalID: hospitalID,
+	})
+	fmt.Println("Exito:", res.Success)
+	fmt.Println("Mensaje:", res.Message)
+}
+
+func (c *client) listAgreements(status api.AgreementStatus) {
+	ui.ClearScreen()
+	fmt.Println("** Acuerdos **")
+	res := c.sendRequest(api.Request{
+		Action:                api.ActionListAgreements,
+		Token:                 c.authToken,
+		AgreementStatusFilter: status,
+	})
+	fmt.Println("Exito:", res.Success)
+	fmt.Println("Mensaje:", res.Message)
+	if !res.Success {
+		return
+	}
+	if len(res.Agreements) == 0 {
+		fmt.Println("No hay acuerdos en ese estado.")
+		return
+	}
+	for _, agreement := range res.Agreements {
+		fmt.Printf("- %s | hospital=%s | centro=%s | estado=%s\n",
+			agreement.ID, agreement.HospitalID, agreement.ResearchCenterID, agreement.Status)
+		if agreement.ReviewComment != "" {
+			fmt.Println("  Comentario:", agreement.ReviewComment)
+		}
+	}
+}
+
+func (c *client) reviewPendingAgreement() {
+	ui.ClearScreen()
+	fmt.Println("** Revisar acuerdos pendientes **")
+
+	res := c.sendRequest(api.Request{
+		Action:                api.ActionListAgreements,
+		Token:                 c.authToken,
+		AgreementStatusFilter: api.AgreementPending,
+	})
+	if !res.Success {
+		fmt.Println("Error:", res.Message)
+		return
+	}
+	if len(res.Agreements) == 0 {
+		fmt.Println("No hay acuerdos pendientes.")
+		return
+	}
+
+	options := make([]string, 0, len(res.Agreements))
+	for _, agreement := range res.Agreements {
+		options = append(options, fmt.Sprintf("%s | centro=%s | solicitado por=%s",
+			agreement.ID, agreement.ResearchCenterID, agreement.RequestedBy))
+	}
+	choice := ui.PrintMenu("Selecciona un acuerdo", options)
+	selected := res.Agreements[choice-1]
+
+	approve := ui.Confirm("Aprobar el acuerdo seleccionado?")
+	status := api.AgreementDenied
+	if approve {
+		status = api.AgreementApproved
+	}
+	comment := ui.ReadInput("Comentario de revision")
+	reviewRes := c.sendRequest(api.Request{
+		Action:                api.ActionReviewAgreement,
+		Token:                 c.authToken,
+		AgreementID:           selected.ID,
+		AgreementReviewStatus: status,
+		AgreementComment:      comment,
+	})
+	fmt.Println("Exito:", reviewRes.Success)
+	fmt.Println("Mensaje:", reviewRes.Message)
+}
+
 func (c *client) createQueryRequest() {
 	ui.ClearScreen()
 	fmt.Println("** Nueva peticion de consulta **")
@@ -388,6 +504,7 @@ func (c *client) createQueryRequest() {
 	fmt.Println("Clasificaciones disponibles:", shortClassificationOptions())
 	fmt.Println("Rangos de edad: 0-17, 18-35, 36-50, 51-65, 66+")
 
+	hospitalID := c.chooseHospital("Selecciona el hospital sobre el que quieres consultar")
 	classification := strings.TrimSpace(ui.ReadInput("Filtrar por clasificacion"))
 	ageRange := strings.TrimSpace(ui.ReadInput("Filtrar por rango de edad"))
 	var query *api.StatsQuery
@@ -395,9 +512,10 @@ func (c *client) createQueryRequest() {
 		query = &api.StatsQuery{Classification: classification, AgeRange: ageRange}
 	}
 	res := c.sendRequest(api.Request{
-		Action: api.ActionCreateQueryRequest,
-		Token:  c.authToken,
-		Query:  query,
+		Action:     api.ActionCreateQueryRequest,
+		Token:      c.authToken,
+		HospitalID: hospitalID,
+		Query:      query,
 	})
 	fmt.Println("Exito:", res.Success)
 	fmt.Println("Mensaje:", res.Message)
@@ -421,8 +539,8 @@ func (c *client) listQueries(status api.QueryStatus) {
 		return
 	}
 	for _, query := range res.QueryRequests {
-		fmt.Printf("- %s | clasificacion=%s | rango=%s | estado=%s\n",
-			query.ID, emptyLabel(query.Classification, "todas"), emptyLabel(query.AgeRange, "todos"), query.Status)
+		fmt.Printf("- %s | hospital=%s | clasificacion=%s | rango=%s | estado=%s\n",
+			query.ID, query.HospitalID, emptyLabel(query.Classification, "todas"), emptyLabel(query.AgeRange, "todos"), query.Status)
 		if query.ReviewComment != "" {
 			fmt.Println("  Comentario:", query.ReviewComment)
 		}
@@ -452,8 +570,8 @@ func (c *client) reviewPendingQuery() {
 
 	options := make([]string, 0, len(res.QueryRequests))
 	for _, query := range res.QueryRequests {
-		options = append(options, fmt.Sprintf("%s | investigador=%s | clasificacion=%s | rango=%s",
-			query.ID, query.RequestedBy, emptyLabel(query.Classification, "todas"), emptyLabel(query.AgeRange, "todos")))
+		options = append(options, fmt.Sprintf("%s | investigador=%s | hospital=%s | clasificacion=%s | rango=%s",
+			query.ID, query.RequestedBy, query.HospitalID, emptyLabel(query.Classification, "todas"), emptyLabel(query.AgeRange, "todos")))
 	}
 	choice := ui.PrintMenu("Selecciona una peticion", options)
 	selected := res.QueryRequests[choice-1]
@@ -495,7 +613,19 @@ func (c *client) toggleConsent() {
 	}
 }
 
+func (c *client) chooseHospital(title string) string {
+	options := make([]string, 0, len(api.HospitalOrganizations))
+	for _, hospitalID := range api.HospitalOrganizations {
+		options = append(options, hospitalID)
+	}
+	return api.HospitalOrganizations[ui.PrintMenu(title, options)-1]
+}
+
 func (c *client) sendRequest(req api.Request) api.Response {
+	if strings.TrimSpace(req.OrganizationID) == "" {
+		req.OrganizationID = c.profileKey
+	}
+
 	jsonData, err := json.Marshal(req)
 	if err != nil {
 		c.log.Println("No se ha podido serializar la peticion JSON:", err)
