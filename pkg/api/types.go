@@ -117,6 +117,11 @@ type StatsRow struct {
 	Count          int    `json:"count"`
 }
 
+type HospitalStatsBlock struct {
+	HospitalID string     `json:"hospitalId"`
+	Rows       []StatsRow `json:"rows"`
+}
+
 type Agreement struct {
 	ID               string          `json:"id"`
 	HospitalID       string          `json:"hospitalId"`

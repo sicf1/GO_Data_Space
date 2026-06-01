@@ -269,6 +269,8 @@ func (s *server) apiHandler(w http.ResponseWriter, r *http.Request) {
 		res = s.reviewQueryRequest(req)
 	case api.ActionSetConsent:
 		res = s.setConsent(req)
+	case api.ActionGetHospitalStats:
+		res = s.getHospitalStats(req)
 	case api.ActionLogout:
 		res = s.logoutUser(req)
 	default:
@@ -803,6 +805,44 @@ func (s *server) setConsent(req api.Request) api.Response {
 		Success:        true,
 		Message:        "Permiso de uso de datos actualizado",
 		ConsentGranted: &consent,
+	}
+}
+
+func (s *server) getHospitalStats(req api.Request) api.Response {
+	session, ok := s.authenticate(req.Token)
+	if !ok {
+		return api.Response{Success: false, Message: "Token invalido o sesion expirada"}
+	}
+	if !api.IsResearchCenterOrganization(session.OrganizationID) {
+		return api.Response{Success: false, Message: "Solo disponible para centros de investigacion"}
+	}
+	if session.Role != api.RoleResearcher && session.Role != api.RoleAdmin {
+		return api.Response{Success: false, Message: "No autorizado para ver estadisticas"}
+	}
+
+	var blocks []api.HospitalStatsBlock
+	for _, hospitalID := range api.HospitalOrganizations {
+		_, found, err := s.findApprovedAgreement(session.OrganizationID, hospitalID)
+		if err != nil {
+			return api.Response{Success: false, Message: "Error al comprobar acuerdos"}
+		}
+		if !found {
+			continue
+		}
+		rows, err := s.computeStats(api.StatsRequest{HospitalID: hospitalID})
+		if err != nil {
+			return api.Response{Success: false, Message: "Error al calcular estadisticas"}
+		}
+		blocks = append(blocks, api.HospitalStatsBlock{
+			HospitalID: hospitalID,
+			Rows:       rows,
+		})
+	}
+
+	return api.Response{
+		Success:       true,
+		Message:       "Estadisticas calculadas correctamente",
+		HospitalStats: blocks,
 	}
 }
 

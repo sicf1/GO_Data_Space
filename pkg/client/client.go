@@ -148,6 +148,7 @@ func (c *client) runAdminMenu() {
 	switch ui.PrintMenu(c.menuTitle(fmt.Sprintf("Administrador (%s)", c.currentUser)), []string{
 		"Dar de alta investigador",
 		"Ver acuerdos del centro",
+		"Ver estadisticas por hospital",
 		"Cerrar sesion",
 		"Salir",
 	}) {
@@ -156,8 +157,10 @@ func (c *client) runAdminMenu() {
 	case 2:
 		c.listAgreements("")
 	case 3:
-		c.logoutUser()
+		c.showHospitalStats()
 	case 4:
+		c.logoutUser()
+	case 5:
 		c.log.Printf("Saliendo de %s...\n", c.profileLabel)
 		c.exitRequested = true
 	}
@@ -194,6 +197,7 @@ func (c *client) runResearcherMenu() {
 		"Hacer peticion de consulta de datos",
 		"Ver consultas aprobadas",
 		"Ver consultas denegadas",
+		"Ver estadisticas por hospital",
 		"Cerrar sesion",
 		"Salir",
 	}) {
@@ -208,8 +212,10 @@ func (c *client) runResearcherMenu() {
 	case 5:
 		c.listQueries(api.QueryDenied)
 	case 6:
-		c.logoutUser()
+		c.showHospitalStats()
 	case 7:
+		c.logoutUser()
+	case 8:
 		c.log.Printf("Saliendo de %s...\n", c.profileLabel)
 		c.exitRequested = true
 	}
@@ -610,6 +616,43 @@ func (c *client) toggleConsent() {
 	fmt.Println("Mensaje:", res.Message)
 	if res.Success {
 		c.consentGranted = res.ConsentGranted
+	}
+}
+
+func (c *client) showHospitalStats() {
+	ui.ClearScreen()
+	fmt.Println("** Estadisticas por hospital **")
+	res := c.sendRequest(api.Request{
+		Action: api.ActionGetHospitalStats,
+		Token:  c.authToken,
+	})
+	fmt.Println("Exito:", res.Success)
+	fmt.Println("Mensaje:", res.Message)
+	if !res.Success {
+		return
+	}
+	if len(res.HospitalStats) == 0 {
+		fmt.Println("No hay estadisticas disponibles (se necesita al menos un acuerdo aprobado).")
+		return
+	}
+	for _, block := range res.HospitalStats {
+		fmt.Printf("\n--- Hospital: %s ---\n", block.HospitalID)
+		if len(block.Rows) == 0 {
+			fmt.Println("  Sin registros disponibles.")
+			continue
+		}
+		classTotals := make(map[string]int)
+		for _, row := range block.Rows {
+			classTotals[row.Classification] += row.Count
+		}
+		currentClass := ""
+		for _, row := range block.Rows {
+			if row.Classification != currentClass {
+				currentClass = row.Classification
+				fmt.Printf("  %s: %d casos\n", currentClass, classTotals[currentClass])
+			}
+			fmt.Printf("    %s: %d\n", row.AgeRange, row.Count)
+		}
 	}
 }
 

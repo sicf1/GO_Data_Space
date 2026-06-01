@@ -15,6 +15,7 @@ const (
 	ActionListQueryRequests      = "listQueryRequests"
 	ActionReviewQueryRequest     = "reviewQueryRequest"
 	ActionSetConsent             = "setConsent"
+	ActionGetHospitalStats       = "getHospitalStats"
 	ActionLogout                 = "logout"
 )
 
@@ -49,6 +50,7 @@ type Response struct {
 	RecordsUploaded int            `json:"recordsUploaded,omitempty"`
 	Agreements      []Agreement    `json:"agreements,omitempty"`
 	StatsRows       []StatsRow     `json:"statsRows,omitempty"`
-	QueryRequests   []StatsRequest `json:"queryRequests,omitempty"`
-	ConsentGranted  *bool          `json:"consentGranted,omitempty"`
+	QueryRequests   []StatsRequest       `json:"queryRequests,omitempty"`
+	HospitalStats   []HospitalStatsBlock `json:"hospitalStats,omitempty"`
+	ConsentGranted  *bool                `json:"consentGranted,omitempty"`
 }
